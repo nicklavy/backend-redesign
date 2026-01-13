@@ -1,4 +1,5 @@
 import SpaServicesPage from "./SpaServicesPage";
+import ActivitiesPage from "./ActivitiesPage";
 import {
   MenuOutlined,
   ArrowLeftOutlined,
@@ -1488,9 +1489,19 @@ const getNavItemsForProduct = (product: ProductKey) => {
   if (product === "activities") {
     return [
       {
+        key: "activities:dashboard",
+        icon: <NavIcon src={bookingURL} />,
+        label: "Activity Dashboard",
+      },
+      {
         key: "activities:calendar",
         icon: <NavIcon src={bookingURL} />,
         label: "Activity Calendar",
+      },
+      {
+        key: "activities:manageactivities",
+        icon: <NavIcon src={resourcesURL} />,
+        label: "Manage Activities",
       },
       {
         key: "activities:waivers",
@@ -1795,9 +1806,11 @@ export default function ReportTablePage() {
     onBack={() => setActiveKey("customers:directory")}
     onUpdateClient={(next) => setClients((arr) => arr.map((c) => (c.id === next.id ? next : c)))}
   />
-) : activeKey === "resources:services" ? (
-  <SpaServicesPage />
-) : activeKey.startsWith("reporting") ? (
+  ) : activeKey === "resources:services" ? (
+    <SpaServicesPage />
+  ) : activeKey === "activities:manageactivities" ? (
+    <ActivitiesPage />
+  ) : activeKey.startsWith("reporting") ? (
   <ReportBuilderTable />
 ) : activeKey === "console:orders" ? (
   <div className="text-sm text-gray-500">Orders page coming soon.</div>

@@ -1,3 +1,4 @@
+import { ChevronDown } from "lucide-react";
 import React, { useMemo, useState } from "react";
 import {
   Button,
@@ -17,6 +18,10 @@ import {
   Radio,
   Col,
   Divider,
+  Modal,
+  Switch,
+  TimePicker,
+  Tooltip,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
@@ -56,6 +61,7 @@ type DurationPricing = {
   isDefault: boolean;
   dowOverrides: DowOverride[];
   dateOverrides: DateOverride[];
+  
 };
 
 type SpaService = {
@@ -81,6 +87,41 @@ type SpaService = {
   equipmentIds: string[];
   addOnIds: string[];
   enhancementIds: string[];
+};
+
+/* ---------- Dynamic pricing types (mock) ---------- */
+
+type AdjustmentType = "pct" | "amt";
+
+type DynamicPricingRule = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  priority: number; // higher wins
+  daysOfWeek: DayOfWeek[]; // empty means "all"
+  startTime: Dayjs; // time-of-day only
+  endTime: Dayjs;
+  adjustmentType: AdjustmentType; // pct or amt
+  adjustmentValue: number; // 10 = +10% or +$10 depending on type
+
+  // Inventory-based condition (optional)
+  inventoryConditionEnabled?: boolean;
+  inventoryMetric?: "remaining" | "utilization" | "lead_time";
+  inventoryOperator?: "lt" | "lte" | "gt" | "gte";
+  inventoryThreshold?: number; // remaining slots, utilization %, or hours depending on metric
+  inventoryLookaheadHours?: number; // evaluate availability over next X hours
+
+  dateRange?: [Dayjs, Dayjs]; // optional date constraint
+
+  // Optional service-level exclusions (advanced)
+excludedServiceIds?: string[];
+};
+
+type CategoryDynamicPricing = {
+  enabled: boolean;
+  minPrice?: number;
+  maxPrice?: number;
+  rules: DynamicPricingRule[];
 };
 
 /* ---------- Mock lookups ---------- */
@@ -143,6 +184,33 @@ const DOW_LABELS: Record<DayOfWeek, string> = {
 
 const allDays: DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
+
+const formatInventoryCondition = (r: DynamicPricingRule): string | null => {
+  if (!r.inventoryConditionEnabled) return null;
+
+  const opMap: Record<NonNullable<DynamicPricingRule["inventoryOperator"]>, string> = {
+    lt: "<",
+    lte: "≤",
+    gt: ">",
+    gte: "≥",
+  };
+
+  const metric = r.inventoryMetric || "remaining";
+  const op =
+    opMap[
+      (r.inventoryOperator || "lt") as NonNullable<
+        DynamicPricingRule["inventoryOperator"]
+      >
+    ];
+  const threshold = r.inventoryThreshold ?? 0;
+  const lookahead = r.inventoryLookaheadHours ?? 0;
+  
+
+  if (metric === "remaining") return `Remaining slots ${op} ${threshold} (next ${lookahead}h)`;
+  if (metric === "utilization") return `Utilization ${op} ${threshold}% (next ${lookahead}h)`;
+  return `Lead time ${op} ${threshold}h`;
+};
+
 /* ---------- Helpers ---------- */
 
 const createEmptyDuration = (minutes = 60, isDefault = false): DurationPricing => ({
@@ -176,6 +244,27 @@ const createEmptyService = (): SpaService => ({
   addOnIds: [],
   enhancementIds: [],
 });
+
+const createEmptyDynamicRule = (): DynamicPricingRule => {
+  const start = dayjs().hour(9).minute(0).second(0);
+  const end = dayjs().hour(17).minute(0).second(0);
+    return {
+    id: Math.random().toString(36).slice(2),
+    name: "",
+    enabled: true,
+    priority: 100,
+    daysOfWeek: [],
+    startTime: start,
+    endTime: end,
+    adjustmentType: "pct",
+    adjustmentValue: 10,
+    inventoryConditionEnabled: false,
+    inventoryMetric: "remaining",
+    inventoryOperator: "lt",
+    inventoryThreshold: 3,
+    inventoryLookaheadHours: 24,
+  };
+};
 
 /* ---------- Duration card component ---------- */
 
@@ -252,6 +341,7 @@ const DurationCard: React.FC<DurationCardProps> = ({
               { label: "90 min", value: 90 },
               { label: "120 min", value: 120 },
             ]}
+            suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
           />
         </Space>
       }
@@ -491,7 +581,9 @@ const handleDurationsChange = (next: DurationPricing[]) => {
               <Row gutter={16}>
                 <Col span={12}>
                   <Form.Item label="Service category" name="category">
-                    <Select options={MOCK_CATEGORIES} />
+                    <Select options={MOCK_CATEGORIES} 
+                        suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+/>
                   </Form.Item>
                 </Col>
                 <Col span={12}>
@@ -775,6 +867,8 @@ const handleDurationsChange = (next: DurationPricing[]) => {
                     allowClear
                     placeholder="Select disclaimer"
                     options={MOCK_DISCLAIMERS}
+                        suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+
                   />
                 </Form.Item>
 
@@ -783,11 +877,15 @@ const handleDurationsChange = (next: DurationPricing[]) => {
                     allowClear
                     placeholder="Select waiver"
                     options={MOCK_WAIVERS}
+                        suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+
                   />
                 </Form.Item>
 
                 <Form.Item label="Cancellation policy" name="cancellationPolicyId">
-                  <Select options={MOCK_POLICIES} />
+                  <Select options={MOCK_POLICIES}
+                      suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+ />
                 </Form.Item>
               </Form>
             </Card>
@@ -823,6 +921,677 @@ const handleDurationsChange = (next: DurationPricing[]) => {
   );
 };
 
+
+/* ---------- Dynamic pricing page (mock UI) ---------- */
+
+type DynamicPricingPageProps = {
+  categories: { label: string; value: string }[];
+};
+
+const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) => {
+  const [selectedCategory, setSelectedCategory] = useState<string>(
+    categories?.[0]?.value || ""
+  );
+
+  // In a real app this would be loaded/saved per property/venue.
+  const [byCategory, setByCategory] = useState<Record<string, CategoryDynamicPricing>>(() => {
+    const initial: Record<string, CategoryDynamicPricing> = {};
+    categories.forEach((c) => {
+      initial[c.value] = {
+        enabled: false,
+        minPrice: undefined,
+        maxPrice: undefined,
+        rules: [],
+      };
+    });
+    return initial;
+  });
+
+  const cfg = byCategory[selectedCategory] || { enabled: false, rules: [] };
+
+  // Services in the selected category (for exclusions dropdown)
+  // NOTE: mocked for demo; in production this should come from real services by category
+  const servicesInCategory = useMemo(() => {
+    return [
+      { id: "svc1", name: "IMPÉRIALE Relaxing Massage" },
+      { id: "svc2", name: "Deep Tissue Massage" },
+      { id: "svc3", name: "Couples Massage" },
+    ];
+  }, [selectedCategory]);
+
+  // Helper to map excluded ids to service names
+  const getExcludedServiceNames = (rule: DynamicPricingRule): string[] => {
+    const ids = rule.excludedServiceIds || [];
+    if (ids.length === 0) return [];
+    const byId = new Map(servicesInCategory.map((s) => [s.id, s.name] as const));
+    return ids.map((id) => byId.get(id) || id);
+  };
+
+  /* ---------- Mock availability (demo) ---------- */
+  const [mockAvailability, setMockAvailability] = useState({
+    remaining: 2, // remaining slots in the lookahead window
+    utilization: 85, // utilization % in lookahead window
+    leadTime: 6, // hours until start time
+  });
+
+  const evalInventoryCondition = (r: DynamicPricingRule): boolean => {
+    if (!r.inventoryConditionEnabled) return true;
+
+    const metric = r.inventoryMetric || "remaining";
+    const op = r.inventoryOperator || "lt";
+    // If older rules (created before inventory conditions existed) are missing a threshold,
+    // fall back to sensible defaults instead of treating it as 0 (which often blocks everything).
+    const defaultThreshold =
+      metric === "utilization" ? 80 : metric === "lead_time" ? 24 : 3;
+
+    const threshold =
+      r.inventoryThreshold === null || r.inventoryThreshold === undefined
+        ? defaultThreshold
+        : r.inventoryThreshold;
+
+    const left =
+      metric === "remaining"
+        ? mockAvailability.remaining
+        : metric === "utilization"
+        ? mockAvailability.utilization
+        : mockAvailability.leadTime;
+
+    if (op === "lt") return left < threshold;
+    if (op === "lte") return left <= threshold;
+    if (op === "gt") return left > threshold;
+    return left >= threshold; // gte
+  };
+
+  const updateCategory = (patch: Partial<CategoryDynamicPricing>) => {
+    setByCategory((prev) => ({
+      ...prev,
+      [selectedCategory]: {
+        ...prev[selectedCategory],
+        ...patch,
+      },
+    }));
+  };
+
+  const upsertRule = (rule: DynamicPricingRule) => {
+    updateCategory({
+      rules: cfg.rules.some((r) => r.id === rule.id)
+        ? cfg.rules.map((r) => (r.id === rule.id ? rule : r))
+        : [...cfg.rules, rule],
+    });
+  };
+
+  const deleteRule = (id: string) => {
+    updateCategory({ rules: cfg.rules.filter((r) => r.id !== id) });
+  };
+
+  const [ruleModalOpen, setRuleModalOpen] = useState(false);
+  const [editingRule, setEditingRule] = useState<DynamicPricingRule | null>(null);
+  const [ruleForm] = Form.useForm();
+
+  const openNewRule = () => {
+    const next = createEmptyDynamicRule();
+    setEditingRule(next);
+    ruleForm.setFieldsValue({
+      ...next,
+      dateRange: next.dateRange,
+      timeRange: [next.startTime, next.endTime],
+    });
+    setRuleModalOpen(true);
+  };
+
+  const openEditRule = (r: DynamicPricingRule) => {
+    setEditingRule(r);
+    ruleForm.setFieldsValue({
+      ...r,
+      dateRange: r.dateRange,
+      timeRange: [r.startTime, r.endTime],
+    });
+    setRuleModalOpen(true);
+  };
+
+  const handleSaveRule = async () => {
+    const values = await ruleForm.validateFields();
+    const timeRange: [Dayjs, Dayjs] | undefined = values.timeRange;
+    const next: DynamicPricingRule = {
+      ...(editingRule || createEmptyDynamicRule()),
+      ...values,
+      enabled: values.enabled ?? true,
+      daysOfWeek: values.daysOfWeek || [],
+      priority: Number(values.priority || 0),
+      adjustmentValue: Number(values.adjustmentValue || 0),
+      inventoryThreshold:
+  values.inventoryThreshold === null || values.inventoryThreshold === undefined
+    ? undefined
+    : Number(values.inventoryThreshold),
+inventoryLookaheadHours:
+  values.inventoryLookaheadHours === null || values.inventoryLookaheadHours === undefined
+    ? undefined
+    : Number(values.inventoryLookaheadHours),
+      startTime: timeRange?.[0] || (editingRule?.startTime ?? dayjs()),
+      endTime: timeRange?.[1] || (editingRule?.endTime ?? dayjs()),
+      dateRange: values.dateRange,
+ excludedServiceIds: values.excludedServiceIds || [],
+    };
+    upsertRule(next);
+    setRuleModalOpen(false);
+    setEditingRule(null);
+    ruleForm.resetFields();
+    
+  };
+
+  const columns: ColumnsType<DynamicPricingRule> = [
+    {
+      title: "Enabled",
+      dataIndex: "enabled",
+      width: 90,
+      render: (_, r) => (
+        <Switch
+          checked={r.enabled}
+          onChange={(checked) => upsertRule({ ...r, enabled: checked })}
+        />
+      ),
+    },
+    {
+      title: "Rule",
+      dataIndex: "name",
+      render: (_, r) => (
+        <div>
+          <div style={{ fontWeight: 600 }}>{r.name || "Untitled rule"}</div>
+          <div style={{ fontSize: 12, color: "#6b7280" }}>
+            {r.daysOfWeek.length ? r.daysOfWeek.map((d) => DOW_LABELS[d]).join(", ") : "All days"}
+            {" · "}
+            {r.startTime.format("h:mma")}–{r.endTime.format("h:mma")}
+            {r.dateRange ? ` · ${r.dateRange[0].format("MMM D")}–${r.dateRange[1].format("MMM D")}` : ""}
+            {formatInventoryCondition(r) ? ` · ${formatInventoryCondition(r)}` : ""}
+            {r.excludedServiceIds && r.excludedServiceIds.length > 0 ? (
+              <>
+                {" · "}
+                <Tooltip
+                  title={
+                    <div>
+                      <div style={{ fontWeight: 600, marginBottom: 6 }}>Excluded services</div>
+                      <ul style={{ margin: 0, paddingLeft: 18 }}>
+                        {getExcludedServiceNames(r).map((name) => (
+                          <li key={name}>{name}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  }
+                >
+                  <span style={{ textDecoration: "underline", textDecorationStyle: "dotted", cursor: "help" }}>
+                    Excludes {r.excludedServiceIds.length} service{r.excludedServiceIds.length > 1 ? "s" : ""}
+                  </span>
+                </Tooltip>
+              </>
+            ) : null}
+          </div>
+        </div>
+      ),
+    },
+    {
+      title: "Adjustment",
+      key: "adj",
+      width: 150,
+      render: (_, r) => {
+        const prefix = r.adjustmentValue >= 0 ? "+" : "";
+        return r.adjustmentType === "pct"
+          ? `${prefix}${r.adjustmentValue}%`
+          : `${prefix}$${Math.abs(r.adjustmentValue)}`;
+      },
+    },
+    {
+      title: "Preview",
+      key: "preview",
+      width: 120,
+      render: (_, r) => {
+        if (!r.inventoryConditionEnabled) return <Tag>Applies</Tag>;
+        const ok = evalInventoryCondition(r);
+        return ok ? <Tag color="green">Applies</Tag> : <Tag color="red">Blocked</Tag>;
+      },
+    },
+    {
+      title: "Priority",
+      dataIndex: "priority",
+      width: 100,
+    },
+    {
+      title: "Actions",
+      key: "actions",
+      width: 160,
+      render: (_, r) => (
+        <Space>
+          <Button type="text" icon={<EditOutlined />} onClick={() => openEditRule(r)}>
+            Edit
+          </Button>
+          <Button
+            type="text"
+            danger
+            icon={<DeleteOutlined />}
+            onClick={() => deleteRule(r.id)}
+          >
+            Delete
+          </Button>
+        </Space>
+      ),
+    },
+  ];
+
+  return (
+    <div style={{ padding: 0 }}>
+      <Space
+        align="center"
+        style={{ width: "100%", justifyContent: "space-between", marginBottom: 16 }}
+      >
+        <div>
+          <Title level={4} style={{ margin: 0 }}>
+            Dynamic Pricing
+          </Title>
+          <Text type="secondary">Define time-based pricing rules by service category.</Text>
+        </div>
+      </Space>
+
+      <Card style={{ borderRadius: 12 }}>
+        <Row gutter={16} align="middle">
+          <Col xs={24} md={10}>
+            <Form layout="vertical">
+              <Form.Item label="Service category">
+                <Select
+                  value={selectedCategory}
+                  onChange={setSelectedCategory}
+                  options={categories}
+                  suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+                />
+              </Form.Item>
+            </Form>
+          </Col>
+
+          <Col xs={24} md={8}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 4 }}>
+              <Switch
+                checked={cfg.enabled}
+                onChange={(checked) => updateCategory({ enabled: checked })}
+              />
+              <div>
+                <div style={{ fontWeight: 600 }}>Enable dynamic pricing</div>
+                <div style={{ fontSize: 12, color: "#6b7280" }}>
+                  When enabled, rules adjust the base/service pricing at runtime.
+                </div>
+              </div>
+            </div>
+          </Col>
+
+          <Col xs={24} md={6}>
+            <div style={{ textAlign: "right" }}>
+              <Button type="primary" icon={<PlusOutlined />} onClick={openNewRule} disabled={!cfg.enabled}>
+                Add rule
+              </Button>
+            </div>
+          </Col>
+        </Row>
+
+        <Divider style={{ margin: "16px 0" }} />
+
+        <Row gutter={16}>
+          <Col xs={24} md={12}>
+            <Card size="small" style={{ borderRadius: 10 }} title="Guardrails (optional)">
+              <Row gutter={12}>
+                <Col span={12}>
+                  <Form layout="vertical">
+                    <Form.Item label="Min price">
+                      <InputNumber
+                        prefix="$"
+                        min={0}
+                        style={{ width: "100%" }}
+                        value={cfg.minPrice}
+                        onChange={(val) => updateCategory({ minPrice: val === null ? undefined : Number(val) })}
+                        disabled={!cfg.enabled}
+                      />
+                    </Form.Item>
+                  </Form>
+                </Col>
+                <Col span={12}>
+                  <Form layout="vertical">
+                    <Form.Item label="Max price">
+                      <InputNumber
+                        prefix="$"
+                        min={0}
+                        style={{ width: "100%" }}
+                        value={cfg.maxPrice}
+                        onChange={(val) => updateCategory({ maxPrice: val === null ? undefined : Number(val) })}
+                        disabled={!cfg.enabled}
+                      />
+                    </Form.Item>
+                  </Form>
+                </Col>
+              </Row>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Guardrails clamp the final price after rules apply.
+              </Text>
+            </Card>
+          </Col>
+
+          <Col xs={24} md={12}>
+            <Card size="small" style={{ borderRadius: 10 }} title="Mock availability (demo)">
+              <Row gutter={12}>
+                <Col span={8}>
+                  <Form layout="vertical">
+                    <Form.Item label="Remaining slots">
+                      <InputNumber
+                        min={0}
+                        style={{ width: "100%" }}
+                        value={mockAvailability.remaining}
+                        onChange={(v) =>
+                          setMockAvailability((p) => ({
+                            ...p,
+                            remaining: Number(v ?? 0),
+                          }))
+                        }
+                        disabled={!cfg.enabled}
+                      />
+                    </Form.Item>
+                  </Form>
+                </Col>
+
+                <Col span={8}>
+                  <Form layout="vertical">
+                    <Form.Item label="Utilization %">
+                      <InputNumber
+                        min={0}
+                        max={100}
+                        style={{ width: "100%" }}
+                        value={mockAvailability.utilization}
+                        onChange={(v) =>
+                          setMockAvailability((p) => ({
+                            ...p,
+                            utilization: Number(v ?? 0),
+                          }))
+                        }
+                        disabled={!cfg.enabled}
+                      />
+                    </Form.Item>
+                  </Form>
+                </Col>
+
+                <Col span={8}>
+                  <Form layout="vertical">
+                    <Form.Item label="Lead time (hours)">
+                      <InputNumber
+                        min={0}
+                        style={{ width: "100%" }}
+                        value={mockAvailability.leadTime}
+                        onChange={(v) =>
+                          setMockAvailability((p) => ({
+                            ...p,
+                            leadTime: Number(v ?? 0),
+                          }))
+                        }
+                        disabled={!cfg.enabled}
+                      />
+                    </Form.Item>
+                  </Form>
+                </Col>
+              </Row>
+
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Use these values to preview inventory-based rules. (Lookahead is not simulated yet; it’s only displayed in the rule summary.)
+              </Text>
+
+              <Divider style={{ margin: "12px 0" }} />
+
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Pricing order (preview): base price → day/date override → highest priority matching rule (including inventory condition) → clamp to min/max.
+              </Text>
+            </Card>
+          </Col>
+        </Row>
+
+        <Divider style={{ margin: "16px 0" }} />
+
+        <Table<DynamicPricingRule>
+          rowKey="id"
+          columns={columns}
+          dataSource={[...cfg.rules].sort((a, b) => b.priority - a.priority)}
+          pagination={{ pageSize: 8 }}
+          locale={{ emptyText: cfg.enabled ? "No rules yet. Click 'Add rule' to create one." : "Enable dynamic pricing to add rules." }}
+        />
+      </Card>
+
+      <Modal
+        title={editingRule?.id ? "Dynamic Pricing Rule" : "New Rule"}
+        open={ruleModalOpen}
+        onCancel={() => {
+          setRuleModalOpen(false);
+          setEditingRule(null);
+          ruleForm.resetFields();
+        }}
+        onOk={handleSaveRule}
+        okText="Save rule"
+      >
+        <Form
+  form={ruleForm}
+  layout="vertical"
+  initialValues={{
+    enabled: true,
+    adjustmentType: "pct",
+    inventoryConditionEnabled: false,
+    inventoryMetric: "remaining",
+    inventoryOperator: "lt",
+    inventoryThreshold: 3,
+    inventoryLookaheadHours: 24,
+    excludedServiceIds: [],
+    
+  }}
+>
+          <Form.Item name="enabled" label="Enabled" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+
+          <Form.Item
+            name="name"
+            label="Rule name"
+            rules={[{ required: true, message: "Please name this rule" }]}
+          >
+            <Input placeholder="e.g., Peak hours uplift" />
+          </Form.Item>
+
+          <Row gutter={12}>
+            <Col span={12}>
+              <Form.Item name="daysOfWeek" label="Days of week (optional)">
+                <Select
+                  mode="multiple"
+                  allowClear
+                  placeholder="All days"
+                  options={allDays.map((d) => ({ label: DOW_LABELS[d], value: d }))}
+                  suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="dateRange" label="Date range (optional)">
+                <RangePicker />
+              </Form.Item>
+            </Col>
+          </Row>
+
+          <Row gutter={12}>
+            <Col span={12}>
+              <Form.Item
+                name="timeRange"
+                label="Time window"
+                rules={[{ required: true, message: "Select a time window" }]}
+              >
+                <TimePicker.RangePicker format="h:mma" use12Hours minuteStep={15} />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="priority" label="Priority (higher wins)">
+                <InputNumber min={0} style={{ width: "100%" }} />
+              </Form.Item>
+            </Col>
+          </Row>
+
+
+          <Divider style={{ margin: "12px 0" }} />
+
+<Row gutter={12} align="middle">
+  <Col span={12}>
+    <Form.Item
+      name="inventoryConditionEnabled"
+      label="Inventory condition"
+      valuePropName="checked"
+    >
+      <Switch />
+    </Form.Item>
+  </Col>
+  <Col span={12}>
+    <Form.Item shouldUpdate noStyle>
+      {() => {
+        const enabled = ruleForm.getFieldValue("inventoryConditionEnabled");
+        return (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {enabled
+              ? "Apply this rule only when availability/demand meets the condition."
+              : "Optional: restrict this rule by availability or lead time."}
+          </Text>
+        );
+      }}
+    </Form.Item>
+  </Col>
+</Row>
+
+<Form.Item shouldUpdate noStyle>
+  {() => {
+    const enabled = ruleForm.getFieldValue("inventoryConditionEnabled");
+    if (!enabled) return null;
+
+    const metric = ruleForm.getFieldValue("inventoryMetric") as
+      | "remaining"
+      | "utilization"
+      | "lead_time"
+      | undefined;
+
+    const thresholdLabel =
+      metric === "utilization"
+        ? "Threshold (%)"
+        : metric === "lead_time"
+        ? "Threshold (hours)"
+        : "Threshold (remaining slots)";
+
+    return (
+      <Row gutter={12}>
+        <Col span={8}>
+          <Form.Item
+            name="inventoryMetric"
+            label="Metric"
+            rules={[{ required: true, message: "Required" }]}
+          >
+            <Select
+              options={[
+                { label: "Remaining slots", value: "remaining" },
+                { label: "Utilization %", value: "utilization" },
+                { label: "Lead time (hours)", value: "lead_time" },
+              ]}
+              suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+            />
+          </Form.Item>
+        </Col>
+
+        <Col span={4}>
+          <Form.Item
+            name="inventoryOperator"
+            label="Op"
+            rules={[{ required: true, message: "Required" }]}
+          >
+            <Select
+              options={[
+                { label: "<", value: "lt" },
+                { label: "≤", value: "lte" },
+                { label: ">", value: "gt" },
+                { label: "≥", value: "gte" },
+              ]}
+              suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+            />
+          </Form.Item>
+        </Col>
+
+        <Col span={6}>
+          <Form.Item
+            name="inventoryThreshold"
+            label={thresholdLabel}
+            rules={[{ required: true, message: "Required" }]}
+          >
+            <InputNumber style={{ width: "100%" }} />
+          </Form.Item>
+        </Col>
+
+        <Col span={6}>
+          <Form.Item
+            name="inventoryLookaheadHours"
+            label="Lookahead (hours)"
+            tooltip="Evaluate availability over the upcoming window (e.g., next 24 hours). Not used for lead time."
+          >
+            <InputNumber
+              min={0}
+              style={{ width: "100%" }}
+              disabled={metric === "lead_time"}
+            />
+          </Form.Item>
+        </Col>
+      </Row>
+    );
+  }}
+</Form.Item>
+
+<Divider style={{ margin: "12px 0" }} />
+
+<Title level={5} style={{ marginBottom: 4 }}>
+  Service scope
+</Title>
+<Text type="secondary" style={{ fontSize: 12 }}>
+  By default, this rule applies to all services in this category. Optionally exclude specific services.
+</Text>
+
+<Form.Item name="excludedServiceIds" style={{ marginTop: 8 }}>
+  <Select
+    mode="multiple"
+    allowClear
+    placeholder="Exclude specific services (optional)"
+    options={servicesInCategory.map((s) => ({
+      label: s.name,
+      value: s.id,
+    }))}
+    suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+  />
+</Form.Item>
+
+          <Row gutter={12}>
+            <Col span={12}>
+              <Form.Item name="adjustmentType" label="Adjustment type">
+                <Select
+                  options={[
+                    { label: "Percent (%)", value: "pct" },
+                    { label: "Dollar amount ($)", value: "amt" },
+                  ]}
+                  suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name="adjustmentValue" label="Adjustment value">
+                <InputNumber style={{ width: "100%" }} />
+              </Form.Item>
+            </Col>
+          </Row>
+
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Example: adjustment type Percent with value 15 means +15%. Use negative values for discounts.
+          </Text>
+        </Form>
+      </Modal>
+    </div>
+  );
+};
+
 /* ---------- Services list view ---------- */
 
 type ServiceListProps = {
@@ -833,6 +1602,7 @@ type ServiceListProps = {
 
 const ServiceList: React.FC<ServiceListProps> = ({ services, onAdd, onEdit }) => {
   const [search, setSearch] = useState("");
+  const [activeTab, setActiveTab] = useState<string>("services");
 
   const filtered = useMemo(() => {
     if (!search.trim()) return services;
@@ -935,21 +1705,35 @@ const ServiceList: React.FC<ServiceListProps> = ({ services, onAdd, onEdit }) =>
       </Space>
 
       <Tabs
-        defaultActiveKey="services"
+        activeKey={activeTab}
+        onChange={setActiveTab}
         items={[
           { key: "services", label: "Services" },
           { key: "categories", label: "Categories" },
+          { key: "dynamic_pricing", label: "Dynamic Pricing" },
           { key: "addons", label: "Add-Ons" },
           { key: "enhancements", label: "Enhancements" },
         ]}
       />
 
-      <Table<SpaService>
-        rowKey="id"
-        columns={columns}
-        dataSource={filtered}
-        pagination={{ pageSize: 10 }}
-      />
+      {activeTab === "services" && (
+        <Table<SpaService>
+          rowKey="id"
+          columns={columns}
+          dataSource={filtered}
+          pagination={{ pageSize: 10 }}
+        />
+      )}
+
+      {activeTab === "dynamic_pricing" && (
+        <DynamicPricingPage categories={MOCK_CATEGORIES} />
+      )}
+
+      {activeTab !== "services" && activeTab !== "dynamic_pricing" && (
+        <Card style={{ borderRadius: 12 }}>
+          <Text type="secondary">This section is a placeholder in the demo.</Text>
+        </Card>
+      )}
     </div>
   );
 };
