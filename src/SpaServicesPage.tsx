@@ -89,6 +89,374 @@ type SpaService = {
   enhancementIds: string[];
 };
 
+
+
+
+/* ---------- Dynamic pricing heat map ---------- */
+
+type DemandMetric = "bookings" | "utilization" | "revenue";
+
+const hourLabels = Array.from({ length: 13 }).map((_, i) => {
+  const h = 8 + i; // 8am–8pm
+  const hour12 = ((h + 11) % 12) + 1;
+  const ampm = h >= 12 ? "PM" : "AM";
+  return { h, label: `${hour12}${ampm}` };
+});
+
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+const HistoricalDemandPanel: React.FC<{
+  servicesInCategory: { id: string; name: string }[];
+  disabled?: boolean;
+  onCreateRuleFromSlot?: (payload: {
+    day: DayOfWeek;
+    startHour: number;
+    endHour: number;
+    score: number;
+  }) => void;
+}> = ({ servicesInCategory, disabled, onCreateRuleFromSlot }) => {
+  const [serviceId, setServiceId] = useState<string>("all");
+  const [lookbackDays, setLookbackDays] = useState<number>(90);
+  const [metric, setMetric] = useState<DemandMetric>("bookings");
+  const [selection, setSelection] = useState<{ day: DayOfWeek; startIdx: number; endIdx: number } | null>(null);
+const [isSelecting, setIsSelecting] = useState(false);
+
+React.useEffect(() => {
+  const onUp = () => setIsSelecting(false);
+  window.addEventListener("mouseup", onUp);
+  return () => window.removeEventListener("mouseup", onUp);
+}, []);
+
+  // Color-coding helper for demand score
+  const demandColor = (score: number) => {
+    if (score <= 30) {
+      return {
+        bg: "#f3f4f6", // low
+        text: "#374151",
+        border: "#e5e7eb",
+      };
+    }
+
+    if (score <= 60) {
+      return {
+        bg: "#e6f4f1", // moderate
+        text: "#065f46",
+        border: "#bfe3da",
+      };
+    }
+
+    if (score <= 80) {
+      return {
+        bg: "#fff4e5", // high
+        text: "#92400e",
+        border: "#fde2b7",
+      };
+    }
+
+    return {
+      bg: "#fee2e2", // peak
+      text: "#991b1b",
+      border: "#fecaca",
+    };
+  };
+
+  const data = useMemo(() => {
+    // MOCK demand model (replace with real API later)
+    // Returns a matrix: day -> hour -> { score, bookings, utilization, revenueIdx }
+    const days: DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+    const serviceBias =
+      serviceId === "all"
+        ? 0
+        : (serviceId.charCodeAt(serviceId.length - 1) % 7) / 20; // 0–0.3
+
+    const lookbackFactor = lookbackDays === 30 ? 0.9 : lookbackDays === 60 ? 1.0 : 1.05;
+
+    const rows = days.map((d, di) => {
+      const cells = hourLabels.map(({ h }, hi) => {
+        // build a believable pattern:
+        // weekends higher, midday higher, evenings moderate, early morning low
+        const weekendBoost = d === "sat" || d === "sun" ? 0.18 : 0;
+        const dayBoost = d === "fri" ? 0.10 : d === "thu" ? 0.06 : 0;
+
+        const midday = Math.exp(-Math.pow((hi - 5) / 2.2, 2)); // peak around ~1pm
+        const evening = Math.exp(-Math.pow((hi - 9) / 2.8, 2)); // peak around ~5pm
+        const base = 0.18 + 0.28 * midday + 0.18 * evening;
+
+        const noise = ((di * 17 + hi * 11) % 13) / 200; // tiny stable noise
+        const score01 = clamp01((base + weekendBoost + dayBoost + serviceBias + noise) * lookbackFactor);
+
+        const score = Math.round(score01 * 100);
+
+        // derived mock stats
+        const bookings = Math.max(0, Math.round(score01 * 12));        // 0–12
+        const utilization = Math.round(score01 * 100);                 // 0–100
+        const revenueIdx = Math.round((0.6 + score01) * 100);          // ~60–160
+
+        return { score, bookings, utilization, revenueIdx, hour: h };
+      });
+
+      return { day: d, dayLabel: DOW_LABELS[d], cells };
+    });
+
+    return rows;
+  }, [serviceId, lookbackDays, metric]);
+
+  const metricLabel =
+    metric === "bookings" ? "Avg bookings" : metric === "utilization" ? "Avg utilization" : "Revenue index";
+
+  const getMetricValue = (cell: any) =>
+    metric === "bookings" ? cell.bookings : metric === "utilization" ? `${cell.utilization}%` : cell.revenueIdx;
+
+  // Find top/low windows for summary (simple)
+  const highlights = useMemo(() => {
+    const flat: { day: string; hour: number; score: number }[] = [];
+    data.forEach((r) => r.cells.forEach((c: any) => flat.push({ day: r.day, hour: c.hour, score: c.score })));
+    flat.sort((a, b) => b.score - a.score);
+    const top = flat.slice(0, 3);
+    const low = [...flat].reverse().slice(0, 3);
+
+    const fmt = (x: any) => {
+      const hour12 = ((x.hour + 11) % 12) + 1;
+      const ampm = x.hour >= 12 ? "PM" : "AM";
+      return `${DOW_LABELS[x.day as DayOfWeek]} ${hour12}${ampm}`;
+    };
+
+    return { top: top.map(fmt), low: low.map(fmt) };
+  }, [data]);
+
+  return (
+    <Card size="small" style={{ borderRadius: 10 }} title="Historical demand (mock)">
+      <Row gutter={12} align="middle">
+        <Col xs={24} md={8}>
+          <Form layout="vertical">
+            <Form.Item label="Service (optional)">
+              <Select
+                value={serviceId}
+                onChange={setServiceId}
+                disabled={disabled}
+                options={[
+                  { label: "All services in category", value: "all" },
+                  ...servicesInCategory.map((s) => ({ label: s.name, value: s.id })),
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Form>
+        </Col>
+
+        <Col xs={12} md={8}>
+          <Form layout="vertical">
+            <Form.Item label="Lookback window">
+              <Select
+                value={lookbackDays}
+                onChange={setLookbackDays}
+                disabled={disabled}
+                options={[
+                  { label: "Last 30 days", value: 30 },
+                  { label: "Last 60 days", value: 60 },
+                  { label: "Last 90 days", value: 90 },
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Form>
+        </Col>
+
+        <Col xs={12} md={8}>
+          <Form layout="vertical">
+            <Form.Item label="Metric">
+              <Select
+                value={metric}
+                onChange={setMetric}
+                disabled={disabled}
+                options={[
+                  { label: "Bookings", value: "bookings" },
+                  { label: "Utilization", value: "utilization" },
+                  { label: "Revenue index", value: "revenue" },
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Form>
+        </Col>
+      </Row>
+
+      <Row gutter={16}>
+        <Col xs={24} md={18}>
+          <Space size="small" wrap style={{ marginBottom: 8 }}>
+            <Tag color="default">0–30 Low</Tag>
+            <Tag color="cyan">31–60 Moderate</Tag>
+            <Tag color="orange">61–80 High</Tag>
+            <Tag color="red">81–100 Peak</Tag>
+          </Space>
+
+          {selection && (
+  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+    <Button
+      type="primary"
+      size="small"
+      disabled={disabled || !onCreateRuleFromSlot}
+      onClick={() => {
+        if (disabled || !onCreateRuleFromSlot) return;
+
+        const a = Math.min(selection.startIdx, selection.endIdx);
+        const b = Math.max(selection.startIdx, selection.endIdx);
+
+        const startHour = hourLabels[a].h;
+        const endHour = hourLabels[b].h + 1;
+
+        const row = data.find((r) => r.day === selection.day);
+        const scores = row ? row.cells.slice(a, b + 1).map((c: any) => Number(c.score || 0)) : [];
+        const avgScore = scores.length ? Math.round(scores.reduce((s, n) => s + n, 0) / scores.length) : 0;
+
+        onCreateRuleFromSlot({
+          day: selection.day,
+          startHour,
+          endHour,
+          score: avgScore,
+        });
+      }}
+    >
+      Create pricing rule
+    </Button>
+
+    <Tag>
+      {DOW_LABELS[selection.day]} · {hourLabels[Math.min(selection.startIdx, selection.endIdx)].label}–
+      {hourLabels[Math.max(selection.startIdx, selection.endIdx)].label}
+    </Tag>
+
+    <Text type="secondary" style={{ fontSize: 12 }}>
+      Tip: click and drag across time slots.
+    </Text>
+  </div>
+)}
+
+          <div style={{ overflowX: "auto", paddingBottom: 6 }}>
+            <div style={{ minWidth: 780 }}>
+              {/* Header row */}
+              <div style={{ display: "grid", gridTemplateColumns: "90px repeat(13, 1fr)", gap: 6, marginBottom: 6 }}>
+                <div />
+                {hourLabels.map((h) => (
+                  <div key={h.h} style={{ fontSize: 11, color: "#6b7280", textAlign: "center" }}>
+                    {h.label}
+                  </div>
+                ))}
+              </div>
+
+              {/* Heatmap rows */}
+              {data.map((row) => (
+                <div
+                  key={row.day}
+                  style={{ display: "grid", gridTemplateColumns: "90px repeat(13, 1fr)", gap: 6, marginBottom: 6 }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>{row.dayLabel}</div>
+
+                  {row.cells.map((cell: any, hi: number) => {
+                    const { bg, text, border } = demandColor(cell.score);
+                    const isSelected =
+                      selection &&
+                      selection.day === row.day &&
+                      hi >= Math.min(selection.startIdx, selection.endIdx) &&
+                      hi <= Math.max(selection.startIdx, selection.endIdx);
+                    return (
+                      <Tooltip
+                        key={`${row.day}-${cell.hour}`}
+                        title={
+                          <div>
+                            <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                              {row.dayLabel} · {((cell.hour + 11) % 12) + 1}
+                              {cell.hour >= 12 ? "PM" : "AM"}
+                            </div>
+                            <div>Demand score: {cell.score}/100</div>
+                            <div>{metricLabel}: {getMetricValue(cell)}</div>
+                          </div>
+                        }
+                      >
+                        <div
+                          style={{
+                            height: 32,
+                            borderRadius: 8,
+                            background: bg,
+                            color: text,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            fontSize: 12,
+                            fontWeight: 500,
+                            cursor: disabled || !onCreateRuleFromSlot ? "default" : "pointer",
+                            border: isSelected ? "2px solid #111827" : `1px solid ${border}`,
+                            position: "relative",
+                          }}
+                          onMouseDown={(e) => {
+  if (disabled || !onCreateRuleFromSlot) return;
+  e.preventDefault();
+  setIsSelecting(true);
+  setSelection({ day: row.day, startIdx: hi, endIdx: hi });
+}}
+onMouseEnter={() => {
+  if (!isSelecting || disabled || !onCreateRuleFromSlot) return;
+  setSelection((prev) => {
+    if (!prev) return prev;
+    if (prev.day !== row.day) return prev;
+    return { ...prev, endIdx: hi };
+  });
+}}
+onDoubleClick={() => {
+  // Double-click creates a rule instantly for one cell
+  if (disabled || !onCreateRuleFromSlot) return;
+  onCreateRuleFromSlot({
+    day: row.day,
+    startHour: cell.hour,
+    endHour: cell.hour + 1,
+    score: cell.score,
+  });
+}}
+                        >
+                          {cell.score}
+                        </div>
+                      </Tooltip>
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            Demand scores are calculated by analyzing historical bookings, utilization, and revenue at each time slot. These signals are normalized across the lookback window and blended into a 0–100 score used for rule evaluation and adjacent-slot pricing.
+          </Text>
+        </Col>
+
+        <Col xs={24} md={6}>
+          <Card size="small" style={{ borderRadius: 10 }} title="Insights">
+            <Text strong>Top demand windows</Text>
+            <div style={{ marginTop: 6, marginBottom: 12 }}>
+              {highlights.top.map((t) => (
+                <Tag key={t} style={{ marginBottom: 6 }}>{t}</Tag>
+              ))}
+            </div>
+
+            <Text strong>Lowest demand windows</Text>
+            <div style={{ marginTop: 6 }}>
+              {highlights.low.map((t) => (
+                <Tag key={t} style={{ marginBottom: 6 }}>{t}</Tag>
+              ))}
+            </div>
+
+            <Divider style={{ margin: "12px 0" }} />
+
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              Next step: allow “Create rule from window” to prefill time range + suggested uplift/discount.
+            </Text>
+          </Card>
+        </Col>
+      </Row>
+    </Card>
+  );
+};
+
+
 /* ---------- Dynamic pricing types (mock) ---------- */
 
 type AdjustmentType = "pct" | "amt";
@@ -106,7 +474,7 @@ type DynamicPricingRule = {
 
   // Inventory-based condition (optional)
   inventoryConditionEnabled?: boolean;
-  inventoryMetric?: "remaining" | "utilization" | "lead_time";
+  inventoryMetric?: "remaining" | "utilization" | "lead_time" | "adjacent_demand";
   inventoryOperator?: "lt" | "lte" | "gt" | "gte";
   inventoryThreshold?: number; // remaining slots, utilization %, or hours depending on metric
   inventoryLookaheadHours?: number; // evaluate availability over next X hours
@@ -1345,6 +1713,33 @@ inventoryLookaheadHours:
           </Col>
         </Row>
 
+
+<Divider style={{ margin: "16px 0" }} />
+
+<HistoricalDemandPanel
+  servicesInCategory={servicesInCategory}
+  disabled={!cfg.enabled}
+  onCreateRuleFromSlot={({ day, startHour, endHour, score }) => {
+    const start = dayjs().hour(Math.floor(startHour)).minute((startHour % 1) * 60).second(0);
+    const end = dayjs().hour(Math.floor(endHour)).minute((endHour % 1) * 60).second(0);
+    const suggestedAdj = score >= 80 ? 15 : score >= 60 ? 10 : 5;
+    const next = createEmptyDynamicRule();
+    next.daysOfWeek = [day];
+    next.startTime = start;
+    next.endTime = end;
+    next.adjustmentType = "pct";
+    next.adjustmentValue = suggestedAdj;
+    next.inventoryConditionEnabled = true;
+    next.inventoryMetric = "adjacent_demand";
+    setEditingRule(next);
+    ruleForm.setFieldsValue({
+      ...next,
+      timeRange: [start, end],
+    });
+    setRuleModalOpen(true);
+  }}
+/>
+
         <Divider style={{ margin: "16px 0" }} />
 
         <Table<DynamicPricingRule>
@@ -1357,7 +1752,7 @@ inventoryLookaheadHours:
       </Card>
 
       <Modal
-        title={editingRule?.id ? "Dynamic Pricing Rule" : "New Rule"}
+        title={editingRule?.id ? "Dynamic Pricing Rule" : "New Pricing Rule (from demand)"}
         open={ruleModalOpen}
         onCancel={() => {
           setRuleModalOpen(false);
