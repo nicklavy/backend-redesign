@@ -200,7 +200,7 @@ React.useEffect(() => {
     });
 
     return rows;
-  }, [serviceId, lookbackDays, metric]);
+  }, [serviceId, lookbackDays]);
 
   const metricLabel =
     metric === "bookings" ? "Avg bookings" : metric === "utilization" ? "Avg utilization" : "Revenue index";
@@ -413,7 +413,7 @@ onDoubleClick={() => {
   });
 }}
                         >
-                          {cell.score}
+                          {getMetricValue(cell)}
                         </div>
                       </Tooltip>
                     );
@@ -474,15 +474,26 @@ type DynamicPricingRule = {
 
   // Inventory-based condition (optional)
   inventoryConditionEnabled?: boolean;
-  inventoryMetric?: "remaining" | "utilization" | "lead_time" | "adjacent_demand";
+  inventoryMetric?: "remaining" | "utilization" | "demand_score";
   inventoryOperator?: "lt" | "lte" | "gt" | "gte";
-  inventoryThreshold?: number; // remaining slots, utilization %, or hours depending on metric
-  inventoryLookaheadHours?: number; // evaluate availability over next X hours
+  inventoryThreshold?: number; // remaining slots, utilization %, or demand score depending on metric
+
+  // Lead time gate (optional) — how far ahead the booking is made, evaluated per slot
+  leadTimeMode?: "none" | "window";
+  leadTimeOperator?: "lt" | "lte" | "gt" | "gte";
+  leadTimeDays?: number;
+  leadTimeHours?: number;
+
+  // Adjacent slot pricing (optional)
+  adjacentPricingEnabled?: boolean;
+  adjacentSlotCount?: number; // number of slots before/after triggered slot to adjust
+  adjacentAdjustmentMode?: "relative" | "fixed";
+  adjacentAdjustmentValue?: number; // relative = % of primary adjustment, fixed = adjustment value
 
   dateRange?: [Dayjs, Dayjs]; // optional date constraint
 
   // Optional service-level exclusions (advanced)
-excludedServiceIds?: string[];
+  excludedServiceIds?: string[];
 };
 
 type CategoryDynamicPricing = {
@@ -571,12 +582,25 @@ const formatInventoryCondition = (r: DynamicPricingRule): string | null => {
       >
     ];
   const threshold = r.inventoryThreshold ?? 0;
-  const lookahead = r.inventoryLookaheadHours ?? 0;
-  
 
-  if (metric === "remaining") return `Remaining slots ${op} ${threshold} (next ${lookahead}h)`;
-  if (metric === "utilization") return `Utilization ${op} ${threshold}% (next ${lookahead}h)`;
-  return `Lead time ${op} ${threshold}h`;
+if (metric === "remaining") return `Remaining slots ${op} ${threshold}`;
+if (metric === "utilization") return `Utilization ${op} ${threshold}%`;
+return `Demand score ${op} ${threshold}/100`;
+};
+
+const formatLeadTime = (r: DynamicPricingRule): string | null => {
+  if (r.leadTimeMode !== "window") return null;
+  const opLabel: Record<NonNullable<DynamicPricingRule["leadTimeOperator"]>, string> = {
+    lt: "less than",
+    lte: "at most",
+    gt: "more than",
+    gte: "at least",
+  };
+  const op = opLabel[r.leadTimeOperator || "lt"];
+  const d = r.leadTimeDays ?? 0;
+  const h = r.leadTimeHours ?? 0;
+  const dur = [d > 0 ? `${d}d` : "", h > 0 || d === 0 ? `${h}h` : ""].filter(Boolean).join(" ");
+  return `Booked ${op} ${dur} before the slot`;
 };
 
 /* ---------- Helpers ---------- */
@@ -616,7 +640,7 @@ const createEmptyService = (): SpaService => ({
 const createEmptyDynamicRule = (): DynamicPricingRule => {
   const start = dayjs().hour(9).minute(0).second(0);
   const end = dayjs().hour(17).minute(0).second(0);
-    return {
+  return {
     id: Math.random().toString(36).slice(2),
     name: "",
     enabled: true,
@@ -627,10 +651,17 @@ const createEmptyDynamicRule = (): DynamicPricingRule => {
     adjustmentType: "pct",
     adjustmentValue: 10,
     inventoryConditionEnabled: false,
-    inventoryMetric: "remaining",
-    inventoryOperator: "lt",
-    inventoryThreshold: 3,
-    inventoryLookaheadHours: 24,
+    inventoryMetric: "utilization",
+    inventoryOperator: "gt",
+    inventoryThreshold: 80,
+    leadTimeMode: "none",
+    leadTimeOperator: "lt",
+    leadTimeDays: 1,
+    leadTimeHours: 0,
+    adjacentPricingEnabled: false,
+    adjacentSlotCount: 1,
+    adjacentAdjustmentMode: "relative",
+    adjacentAdjustmentValue: 60,
   };
 };
 
@@ -1337,10 +1368,10 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
 
   /* ---------- Mock availability (demo) ---------- */
   const [mockAvailability, setMockAvailability] = useState({
-    remaining: 2, // remaining slots in the lookahead window
-    utilization: 85, // utilization % in lookahead window
-    leadTime: 6, // hours until start time
-  });
+  remaining: 2, // remaining providers for the booked time slot
+  utilization: 85, // utilization % for the booked time slot
+  demandScore: 75, // historical demand score for the slot, 0–100
+});
 
   const evalInventoryCondition = (r: DynamicPricingRule): boolean => {
     if (!r.inventoryConditionEnabled) return true;
@@ -1349,8 +1380,12 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
     const op = r.inventoryOperator || "lt";
     // If older rules (created before inventory conditions existed) are missing a threshold,
     // fall back to sensible defaults instead of treating it as 0 (which often blocks everything).
-    const defaultThreshold =
-      metric === "utilization" ? 80 : metric === "lead_time" ? 24 : 3;
+      const defaultThreshold =
+    metric === "utilization"
+      ? 80
+      : metric === "demand_score"
+      ? 70
+      : 3;
 
     const threshold =
       r.inventoryThreshold === null || r.inventoryThreshold === undefined
@@ -1358,11 +1393,11 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
         : r.inventoryThreshold;
 
     const left =
-      metric === "remaining"
-        ? mockAvailability.remaining
-        : metric === "utilization"
-        ? mockAvailability.utilization
-        : mockAvailability.leadTime;
+    metric === "remaining"
+      ? mockAvailability.remaining
+      : metric === "utilization"
+      ? mockAvailability.utilization
+      : mockAvailability.demandScore;
 
     if (op === "lt") return left < threshold;
     if (op === "lte") return left <= threshold;
@@ -1428,23 +1463,32 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
       priority: Number(values.priority || 0),
       adjustmentValue: Number(values.adjustmentValue || 0),
       inventoryThreshold:
-  values.inventoryThreshold === null || values.inventoryThreshold === undefined
-    ? undefined
-    : Number(values.inventoryThreshold),
-inventoryLookaheadHours:
-  values.inventoryLookaheadHours === null || values.inventoryLookaheadHours === undefined
-    ? undefined
-    : Number(values.inventoryLookaheadHours),
+        values.inventoryThreshold === null || values.inventoryThreshold === undefined
+          ? undefined
+          : Number(values.inventoryThreshold),
+      leadTimeMode: values.leadTimeMode || "none",
+      leadTimeOperator: values.leadTimeOperator || "lt",
+      leadTimeDays: Number(values.leadTimeDays || 0),
+      leadTimeHours: Number(values.leadTimeHours || 0),
+      adjacentPricingEnabled: values.adjacentPricingEnabled ?? false,
+      adjacentSlotCount:
+        values.adjacentSlotCount === null || values.adjacentSlotCount === undefined
+          ? undefined
+          : Number(values.adjacentSlotCount),
+      adjacentAdjustmentMode: values.adjacentAdjustmentMode || "relative",
+      adjacentAdjustmentValue:
+        values.adjacentAdjustmentValue === null || values.adjacentAdjustmentValue === undefined
+          ? undefined
+          : Number(values.adjacentAdjustmentValue),
       startTime: timeRange?.[0] || (editingRule?.startTime ?? dayjs()),
       endTime: timeRange?.[1] || (editingRule?.endTime ?? dayjs()),
       dateRange: values.dateRange,
- excludedServiceIds: values.excludedServiceIds || [],
+      excludedServiceIds: values.excludedServiceIds || [],
     };
     upsertRule(next);
     setRuleModalOpen(false);
     setEditingRule(null);
     ruleForm.resetFields();
-    
   };
 
   const columns: ColumnsType<DynamicPricingRule> = [
@@ -1471,6 +1515,14 @@ inventoryLookaheadHours:
             {r.startTime.format("h:mma")}–{r.endTime.format("h:mma")}
             {r.dateRange ? ` · ${r.dateRange[0].format("MMM D")}–${r.dateRange[1].format("MMM D")}` : ""}
             {formatInventoryCondition(r) ? ` · ${formatInventoryCondition(r)}` : ""}
+            {formatLeadTime(r) ? ` · ${formatLeadTime(r)}` : ""}
+            {r.adjacentPricingEnabled
+              ? ` · Adjacent: ${r.adjacentSlotCount || 1} slot${(r.adjacentSlotCount || 1) > 1 ? "s" : ""} @ ${
+                  r.adjacentAdjustmentMode === "fixed"
+                    ? `${r.adjacentAdjustmentValue || 0}${r.adjustmentType === "pct" ? "%" : "$"}`
+                    : `${r.adjacentAdjustmentValue || 60}% of primary`
+                }`
+              : ""}
             {r.excludedServiceIds && r.excludedServiceIds.length > 0 ? (
               <>
                 {" · "}
@@ -1501,16 +1553,17 @@ inventoryLookaheadHours:
       key: "adj",
       width: 150,
       render: (_, r) => {
-        const prefix = r.adjustmentValue >= 0 ? "+" : "";
+        const sign = r.adjustmentValue >= 0 ? "+" : "-";
+        const magnitude = Math.abs(r.adjustmentValue);
         return r.adjustmentType === "pct"
-          ? `${prefix}${r.adjustmentValue}%`
-          : `${prefix}$${Math.abs(r.adjustmentValue)}`;
+          ? `${sign}${magnitude}%`
+          : `${sign}$${magnitude}`;
       },
     },
     {
-      title: "Preview",
+      title: "Condition check",
       key: "preview",
-      width: 120,
+      width: 140,
       render: (_, r) => {
         if (!r.inventoryConditionEnabled) return <Tag>Applies</Tag>;
         const ok = evalInventoryCondition(r);
@@ -1599,6 +1652,39 @@ inventoryLookaheadHours:
 
         <Divider style={{ margin: "16px 0" }} />
 
+        <HistoricalDemandPanel
+          servicesInCategory={servicesInCategory}
+          disabled={!cfg.enabled}
+          onCreateRuleFromSlot={({ day, startHour, endHour, score }) => {
+            const start = dayjs().hour(Math.floor(startHour)).minute((startHour % 1) * 60).second(0);
+            const end = dayjs().hour(Math.floor(endHour)).minute((endHour % 1) * 60).second(0);
+            const suggestedAdj = score >= 80 ? 15 : score >= 60 ? 10 : 5;
+            const next = createEmptyDynamicRule();
+            next.daysOfWeek = [day];
+            next.startTime = start;
+            next.endTime = end;
+            next.adjustmentType = "pct";
+            next.adjustmentValue = suggestedAdj;
+            next.inventoryConditionEnabled = true;
+            next.inventoryMetric = "demand_score";
+            next.inventoryOperator = "gte";
+            next.inventoryThreshold = score >= 80 ? 75 : score >= 60 ? 60 : 40;
+            next.adjacentPricingEnabled = true;
+            next.adjacentSlotCount = 1;
+            next.adjacentAdjustmentMode = "relative";
+            next.adjacentAdjustmentValue = 60;
+            next.name = `${DOW_LABELS[day]} ${start.format("h:mma")}–${end.format("h:mma")} demand uplift`;
+            setEditingRule(next);
+            ruleForm.setFieldsValue({
+              ...next,
+              timeRange: [start, end],
+            });
+            setRuleModalOpen(true);
+          }}
+        />
+
+        <Divider style={{ margin: "16px 0" }} />
+
         <Row gutter={16}>
           <Col xs={24} md={12}>
             <Card size="small" style={{ borderRadius: 10 }} title="Guardrails (optional)">
@@ -1641,26 +1727,7 @@ inventoryLookaheadHours:
           <Col xs={24} md={12}>
             <Card size="small" style={{ borderRadius: 10 }} title="Mock availability (demo)">
               <Row gutter={12}>
-                <Col span={8}>
-                  <Form layout="vertical">
-                    <Form.Item label="Remaining slots">
-                      <InputNumber
-                        min={0}
-                        style={{ width: "100%" }}
-                        value={mockAvailability.remaining}
-                        onChange={(v) =>
-                          setMockAvailability((p) => ({
-                            ...p,
-                            remaining: Number(v ?? 0),
-                          }))
-                        }
-                        disabled={!cfg.enabled}
-                      />
-                    </Form.Item>
-                  </Form>
-                </Col>
-
-                <Col span={8}>
+                <Col span={12}>
                   <Form layout="vertical">
                     <Form.Item label="Utilization %">
                       <InputNumber
@@ -1680,17 +1747,37 @@ inventoryLookaheadHours:
                   </Form>
                 </Col>
 
-                <Col span={8}>
+                <Col span={12}>
                   <Form layout="vertical">
-                    <Form.Item label="Lead time (hours)">
+                    <Form.Item label="Remaining slots">
                       <InputNumber
                         min={0}
                         style={{ width: "100%" }}
-                        value={mockAvailability.leadTime}
+                        value={mockAvailability.remaining}
                         onChange={(v) =>
                           setMockAvailability((p) => ({
                             ...p,
-                            leadTime: Number(v ?? 0),
+                            remaining: Number(v ?? 0),
+                          }))
+                        }
+                        disabled={!cfg.enabled}
+                      />
+                    </Form.Item>
+                  </Form>
+                </Col>
+
+                <Col span={12}>
+                  <Form layout="vertical">
+                    <Form.Item label="Demand score">
+                      <InputNumber
+                        min={0}
+                        max={100}
+                        style={{ width: "100%" }}
+                        value={mockAvailability.demandScore}
+                        onChange={(v) =>
+                          setMockAvailability((p) => ({
+                            ...p,
+                            demandScore: Number(v ?? 0),
                           }))
                         }
                         disabled={!cfg.enabled}
@@ -1701,44 +1788,17 @@ inventoryLookaheadHours:
               </Row>
 
               <Text type="secondary" style={{ fontSize: 12 }}>
-                Use these values to preview inventory-based rules. (Lookahead is not simulated yet; it’s only displayed in the rule summary.)
+                Use these values to preview how trigger conditions evaluate. (The evaluation window isn't simulated yet — it only appears in the rule summary.)
               </Text>
 
               <Divider style={{ margin: "12px 0" }} />
 
               <Text type="secondary" style={{ fontSize: 12 }}>
-                Pricing order (preview): base price → day/date override → highest priority matching rule (including inventory condition) → clamp to min/max.
+                Pricing order (preview): base price → day/date override → highest priority matching rule (including trigger condition) → clamp to min/max.
               </Text>
             </Card>
           </Col>
         </Row>
-
-
-<Divider style={{ margin: "16px 0" }} />
-
-<HistoricalDemandPanel
-  servicesInCategory={servicesInCategory}
-  disabled={!cfg.enabled}
-  onCreateRuleFromSlot={({ day, startHour, endHour, score }) => {
-    const start = dayjs().hour(Math.floor(startHour)).minute((startHour % 1) * 60).second(0);
-    const end = dayjs().hour(Math.floor(endHour)).minute((endHour % 1) * 60).second(0);
-    const suggestedAdj = score >= 80 ? 15 : score >= 60 ? 10 : 5;
-    const next = createEmptyDynamicRule();
-    next.daysOfWeek = [day];
-    next.startTime = start;
-    next.endTime = end;
-    next.adjustmentType = "pct";
-    next.adjustmentValue = suggestedAdj;
-    next.inventoryConditionEnabled = true;
-    next.inventoryMetric = "adjacent_demand";
-    setEditingRule(next);
-    ruleForm.setFieldsValue({
-      ...next,
-      timeRange: [start, end],
-    });
-    setRuleModalOpen(true);
-  }}
-/>
 
         <Divider style={{ margin: "16px 0" }} />
 
@@ -1752,7 +1812,8 @@ inventoryLookaheadHours:
       </Card>
 
       <Modal
-        title={editingRule?.id ? "Dynamic Pricing Rule" : "New Pricing Rule (from demand)"}
+        title="Dynamic Pricing Rule"
+        width={640}
         open={ruleModalOpen}
         onCancel={() => {
           setRuleModalOpen(false);
@@ -1769,12 +1830,18 @@ inventoryLookaheadHours:
     enabled: true,
     adjustmentType: "pct",
     inventoryConditionEnabled: false,
-    inventoryMetric: "remaining",
-    inventoryOperator: "lt",
-    inventoryThreshold: 3,
-    inventoryLookaheadHours: 24,
+    inventoryMetric: "utilization",
+    inventoryOperator: "gt",
+    inventoryThreshold: 80,
+    leadTimeMode: "none",
+    leadTimeOperator: "lt",
+    leadTimeDays: 1,
+    leadTimeHours: 0,
+    adjacentPricingEnabled: false,
+    adjacentSlotCount: 1,
+    adjacentAdjustmentMode: "relative",
+    adjacentAdjustmentValue: 60,
     excludedServiceIds: [],
-    
   }}
 >
           <Form.Item name="enabled" label="Enabled" valuePropName="checked">
@@ -1808,23 +1875,91 @@ inventoryLookaheadHours:
             </Col>
           </Row>
 
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item
-                name="timeRange"
-                label="Time window"
-                rules={[{ required: true, message: "Select a time window" }]}
-              >
-                <TimePicker.RangePicker format="h:mma" use12Hours minuteStep={15} />
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="priority" label="Priority (higher wins)">
-                <InputNumber min={0} style={{ width: "100%" }} />
-              </Form.Item>
-            </Col>
-          </Row>
+                 <Row gutter={12}>
+          <Col span={12}>
+            <Form.Item
+              name="timeRange"
+              label="Time window"
+              rules={[{ required: true, message: "Select a time window" }]}
+            >
+              <TimePicker.RangePicker format="h:mma" use12Hours minuteStep={15} />
+            </Form.Item>
+          </Col>
+          <Col span={12}>
+            <Form.Item name="priority" label="Priority (higher wins)">
+              <InputNumber min={0} style={{ width: "100%" }} />
+            </Form.Item>
+          </Col>
+        </Row>
 
+          <Divider style={{ margin: "12px 0" }} />
+
+        <Title level={5} style={{ marginBottom: 4 }}>
+          Lead time
+        </Title>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          Optionally gate this rule by how far ahead the booking is made, measured per slot.
+        </Text>
+
+        <Row gutter={12} style={{ marginTop: 8 }}>
+          <Col span={24}>
+            <Form.Item name="leadTimeMode" label="Lead time">
+              <Select
+                options={[
+                  { label: "None (no lead-time gate)", value: "none" },
+                  { label: "Lead-time window", value: "window" },
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Col>
+        </Row>
+
+        <Form.Item shouldUpdate noStyle>
+          {() => {
+            const mode = ruleForm.getFieldValue("leadTimeMode");
+            if (mode !== "window") return null;
+            return (
+              <Row gutter={12}>
+                <Col span={12}>
+                  <Form.Item
+                    name="leadTimeOperator"
+                    label="Comparison"
+                    rules={[{ required: true, message: "Required" }]}
+                  >
+                    <Select
+                      options={[
+                        { label: "is less than (<)", value: "lt" },
+                        { label: "is at most (≤)", value: "lte" },
+                        { label: "is greater than (>)", value: "gt" },
+                        { label: "is at least (≥)", value: "gte" },
+                      ]}
+                      suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+                    />
+                  </Form.Item>
+                </Col>
+                <Col span={6}>
+                  <Form.Item
+                    name="leadTimeDays"
+                    label="Days"
+                    rules={[{ required: true, message: "Required" }]}
+                  >
+                    <InputNumber min={0} style={{ width: "100%" }} />
+                  </Form.Item>
+                </Col>
+                <Col span={6}>
+                  <Form.Item
+                    name="leadTimeHours"
+                    label="Hours"
+                    rules={[{ required: true, message: "Required" }]}
+                  >
+                    <InputNumber min={0} max={23} style={{ width: "100%" }} />
+                  </Form.Item>
+                </Col>
+              </Row>
+            );
+          }}
+        </Form.Item>
 
           <Divider style={{ margin: "12px 0" }} />
 
@@ -1832,7 +1967,7 @@ inventoryLookaheadHours:
   <Col span={12}>
     <Form.Item
       name="inventoryConditionEnabled"
-      label="Inventory condition"
+      label="Trigger condition"
       valuePropName="checked"
     >
       <Switch />
@@ -1845,8 +1980,8 @@ inventoryLookaheadHours:
         return (
           <Text type="secondary" style={{ fontSize: 12 }}>
             {enabled
-              ? "Apply this rule only when availability/demand meets the condition."
-              : "Optional: restrict this rule by availability or lead time."}
+              ? "This rule applies only when the trigger condition below is met."
+              : "Optional — gate this rule by demand, availability, or lead time."}
           </Text>
         );
       }}
@@ -1860,76 +1995,190 @@ inventoryLookaheadHours:
     if (!enabled) return null;
 
     const metric = ruleForm.getFieldValue("inventoryMetric") as
-      | "remaining"
-      | "utilization"
-      | "lead_time"
-      | undefined;
+  | "remaining"
+  | "utilization"
+  | "demand_score"
+  | undefined;
 
-    const thresholdLabel =
-      metric === "utilization"
-        ? "Threshold (%)"
-        : metric === "lead_time"
-        ? "Threshold (hours)"
-        : "Threshold (remaining slots)";
+const thresholdLabel =
+  metric === "utilization"
+    ? "Threshold (%)"
+    : metric === "demand_score"
+    ? "Threshold (demand score 0–100)"
+    : "Threshold (remaining slots)";
+
+    return (
+      <>
+        <Row gutter={12}>
+          <Col span={12}>
+            <Form.Item
+              name="inventoryMetric"
+              label="Metric"
+              rules={[{ required: true, message: "Required" }]}
+            >
+              <Select
+                options={[
+                  { label: "Utilization %", value: "utilization" },
+                  { label: "Remaining slots", value: "remaining" },
+                  { label: "Demand score", value: "demand_score" },
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Col>
+
+          <Col span={12}>
+            <Form.Item
+              name="inventoryOperator"
+              label="Comparison"
+              rules={[{ required: true, message: "Required" }]}
+            >
+              <Select
+                options={[
+                  { label: "is less than (<)", value: "lt" },
+                  { label: "is at most (≤)", value: "lte" },
+                  { label: "is greater than (>)", value: "gt" },
+                  { label: "is at least (≥)", value: "gte" },
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Col>
+
+          <Col span={12}>
+            <Form.Item
+              name="inventoryThreshold"
+              label={thresholdLabel}
+              rules={[{ required: true, message: "Required" }]}
+            >
+              <InputNumber style={{ width: "100%" }} />
+            </Form.Item>
+          </Col>
+        </Row>
+      </>
+    );
+  }}
+</Form.Item>
+
+<Divider style={{ margin: "12px 0" }} />
+
+<Title level={5} style={{ marginBottom: 4 }}>
+  Price adjustment
+</Title>
+<Text type="secondary" style={{ fontSize: 12 }}>
+  Define what happens when this rule applies.
+</Text>
+
+<Row gutter={12} style={{ marginTop: 8 }}>
+  <Col span={12}>
+    <Form.Item name="adjustmentType" label="Adjustment type">
+      <Select
+        options={[
+          { label: "Percent (%)", value: "pct" },
+          { label: "Dollar amount ($)", value: "amt" },
+        ]}
+        suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+      />
+    </Form.Item>
+  </Col>
+  <Col span={12}>
+    <Form.Item name="adjustmentValue" label="Adjustment value">
+      <InputNumber style={{ width: "100%" }} />
+    </Form.Item>
+  </Col>
+</Row>
+
+<Text type="secondary" style={{ fontSize: 12 }}>
+  Example: Percent with value 15 means +15%. Use negative values for discounts.
+</Text>
+
+<Divider style={{ margin: "12px 0" }} />
+
+<Title level={5} style={{ marginBottom: 4 }}>
+  Adjacent time slots
+</Title>
+<Text type="secondary" style={{ fontSize: 12 }}>
+  Optionally apply a reduced adjustment to nearby time slots when this rule is triggered.
+</Text>
+
+<Row gutter={12} align="middle" style={{ marginTop: 8 }}>
+  <Col span={12}>
+    <Form.Item
+      name="adjacentPricingEnabled"
+      label="Apply to nearby slots"
+      valuePropName="checked"
+    >
+      <Switch />
+    </Form.Item>
+  </Col>
+  <Col span={12}>
+    <Form.Item shouldUpdate noStyle>
+      {() => {
+        const enabled = ruleForm.getFieldValue("adjacentPricingEnabled");
+        return (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {enabled
+              ? "Nearby slots inherit a smaller pricing adjustment from this rule."
+              : "Keeps pricing limited to the selected rule window."}
+          </Text>
+        );
+      }}
+    </Form.Item>
+  </Col>
+</Row>
+
+<Form.Item shouldUpdate noStyle>
+  {() => {
+    const enabled = ruleForm.getFieldValue("adjacentPricingEnabled");
+    const mode = ruleForm.getFieldValue("adjacentAdjustmentMode") as "relative" | "fixed" | undefined;
+    const primaryType = ruleForm.getFieldValue("adjustmentType") as AdjustmentType | undefined;
+    if (!enabled) return null;
 
     return (
       <Row gutter={12}>
-        <Col span={8}>
+        <Col span={12}>
           <Form.Item
-            name="inventoryMetric"
-            label="Metric"
+            name="adjacentSlotCount"
+            label="Slots affected"
+            tooltip="Number of time slots before and after the triggered slot."
+            rules={[{ required: true, message: "Required" }]}
+          >
+            <InputNumber min={1} max={4} style={{ width: "100%" }} />
+          </Form.Item>
+        </Col>
+
+        <Col span={12}>
+          <Form.Item
+            name="adjacentAdjustmentMode"
+            label="Adjacent pricing"
             rules={[{ required: true, message: "Required" }]}
           >
             <Select
               options={[
-                { label: "Remaining slots", value: "remaining" },
-                { label: "Utilization %", value: "utilization" },
-                { label: "Lead time (hours)", value: "lead_time" },
+                { label: "Relative to primary", value: "relative" },
+                { label: "Fixed adjustment", value: "fixed" },
               ]}
               suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
             />
           </Form.Item>
         </Col>
 
-        <Col span={4}>
+        <Col span={24}>
           <Form.Item
-            name="inventoryOperator"
-            label="Op"
+            name="adjacentAdjustmentValue"
+            label={
+              mode === "fixed"
+                ? `Adjacent adjustment value (${primaryType === "amt" ? "$" : "%"})`
+                : "Adjacent strength (% of primary)"
+            }
+            tooltip={
+              mode === "fixed"
+                ? "Applies this exact adjustment to nearby slots."
+                : "Example: 60 means nearby slots receive 60% of the primary adjustment."
+            }
             rules={[{ required: true, message: "Required" }]}
           >
-            <Select
-              options={[
-                { label: "<", value: "lt" },
-                { label: "≤", value: "lte" },
-                { label: ">", value: "gt" },
-                { label: "≥", value: "gte" },
-              ]}
-              suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
-            />
-          </Form.Item>
-        </Col>
-
-        <Col span={6}>
-          <Form.Item
-            name="inventoryThreshold"
-            label={thresholdLabel}
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <InputNumber style={{ width: "100%" }} />
-          </Form.Item>
-        </Col>
-
-        <Col span={6}>
-          <Form.Item
-            name="inventoryLookaheadHours"
-            label="Lookahead (hours)"
-            tooltip="Evaluate availability over the upcoming window (e.g., next 24 hours). Not used for lead time."
-          >
-            <InputNumber
-              min={0}
-              style={{ width: "100%" }}
-              disabled={metric === "lead_time"}
-            />
+            <InputNumber min={0} style={{ width: "100%" }} />
           </Form.Item>
         </Col>
       </Row>
@@ -1959,28 +2208,7 @@ inventoryLookaheadHours:
   />
 </Form.Item>
 
-          <Row gutter={12}>
-            <Col span={12}>
-              <Form.Item name="adjustmentType" label="Adjustment type">
-                <Select
-                  options={[
-                    { label: "Percent (%)", value: "pct" },
-                    { label: "Dollar amount ($)", value: "amt" },
-                  ]}
-                  suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
-                />
-              </Form.Item>
-            </Col>
-            <Col span={12}>
-              <Form.Item name="adjustmentValue" label="Adjustment value">
-                <InputNumber style={{ width: "100%" }} />
-              </Form.Item>
-            </Col>
-          </Row>
-
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            Example: adjustment type Percent with value 15 means +15%. Use negative values for discounts.
-          </Text>
+          
         </Form>
       </Modal>
     </div>
@@ -1993,11 +2221,12 @@ type ServiceListProps = {
   services: SpaService[];
   onAdd: () => void;
   onEdit: (svc: SpaService) => void;
+  initialTab?: string;
 };
 
-const ServiceList: React.FC<ServiceListProps> = ({ services, onAdd, onEdit }) => {
+const ServiceList: React.FC<ServiceListProps> = ({ services, onAdd, onEdit, initialTab }) => {
   const [search, setSearch] = useState("");
-  const [activeTab, setActiveTab] = useState<string>("services");
+  const [activeTab, setActiveTab] = useState<string>(initialTab ?? "services");
 
   const filtered = useMemo(() => {
     if (!search.trim()) return services;
@@ -2135,7 +2364,7 @@ const ServiceList: React.FC<ServiceListProps> = ({ services, onAdd, onEdit }) =>
 
 /* ---------- Page wrapper ---------- */
 
-const SpaServicesPage: React.FC = () => {
+const SpaServicesPage: React.FC<{ initialTab?: string }> = ({ initialTab }) => {
   const [services, setServices] = useState<SpaService[]>([
     {
       ...createEmptyService(),
@@ -2185,6 +2414,7 @@ const SpaServicesPage: React.FC = () => {
       services={services}
       onAdd={() => setEditing(createEmptyService())}
       onEdit={(svc) => setEditing(svc)}
+      initialTab={initialTab}
     />
   );
 };

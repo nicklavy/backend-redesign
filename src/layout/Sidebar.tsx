@@ -9,6 +9,7 @@ type NavItem = {
 
 type ProductNav = Record<ProductKey, NavItem[]>;
 
+
 const navByProduct: ProductNav = {
   control: [
     { id: "overview", label: "Overview" },
@@ -21,6 +22,7 @@ const navByProduct: ProductNav = {
     { id: "customers", label: "Customers" },
     { id: "staff", label: "Staff" },
     { id: "reporting", label: "Reporting" },
+    { id: "daily-report", label: "Daily Report" },
     { id: "resources", label: "Resources" },
     { id: "retail", label: "Retail" },
     { id: "settings", label: "Settings" },
@@ -55,7 +57,12 @@ const navByProduct: ProductNav = {
   ],
 };
 
-const Sidebar: React.FC = () => {
+type SidebarProps = {
+  activePage: string;
+  onNavigate: (page: string) => void;
+};
+
+const Sidebar: React.FC<SidebarProps> = ({ activePage, onNavigate }) => {
   const { product } = useProduct();
   const navItems = navByProduct[product];
 
@@ -65,18 +72,31 @@ const Sidebar: React.FC = () => {
         <button
           key={item.id}
           type="button"
-          className="w-full flex items-center justify-between px-3 py-2 rounded-xl hover:bg-slate-50 text-left"
+          className={`w-full flex items-center justify-between px-3 py-2 rounded-xl text-left transition ${
+            activePage === item.id
+              ? "bg-slate-900 text-white shadow-sm"
+              : "text-slate-900 hover:bg-slate-50"
+          }`}
+          onClick={() => onNavigate(item.id)}
         >
           <div className="flex items-center gap-2">
             {/* Placeholder for icons – dev team can swap with real icons/NavIcon later */}
-            <span className="w-6 h-6 rounded-lg bg-slate-100 flex items-center justify-center text-[13px]">
+            <span
+              className={`w-6 h-6 rounded-lg flex items-center justify-center text-[13px] ${
+                activePage === item.id ? "bg-white/15" : "bg-slate-100"
+              }`}
+            >
               📋
             </span>
-            <span className="text-sm font-medium text-slate-900">
+            <span
+              className={`text-sm font-medium ${
+                activePage === item.id ? "text-white" : "text-slate-900"
+              }`}
+            >
               {item.label}
             </span>
           </div>
-          <span className="text-xs text-slate-400">⌄</span>
+          <span className={`text-xs ${activePage === item.id ? "text-white/70" : "text-slate-400"}`}>⌄</span>
         </button>
       ))}
     </aside>
