@@ -1,6 +1,7 @@
 import { ChevronDown } from "lucide-react";
 import React, { useMemo, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
   Checkbox,
@@ -29,6 +30,11 @@ import {
   EditOutlined,
   DeleteOutlined,
   ArrowLeftOutlined,
+  ArrowUpOutlined,
+  ArrowDownOutlined,
+  CopyOutlined,
+  CheckOutlined,
+  CloseOutlined,
 } from "@ant-design/icons";
 import dayjs, { Dayjs } from "dayjs";
 
@@ -94,7 +100,23 @@ type SpaService = {
 
 /* ---------- Dynamic pricing heat map ---------- */
 
-type DemandMetric = "bookings" | "utilization" | "revenue";
+// Metrics match the reference deck exactly, placed where page 2 lists them: Bookings, Utilization,
+// and Revenue Index are heat-map (historical) metrics; RevPATH is the deck's own proposed addition
+// to that same heat-map section (page 8), so it lives here too. Demand score is intentionally not
+// included — it isn't in the deck, and was shelved pending a separate, dedicated definition.
+type DemandMetric = "bookings" | "utilization" | "revenue" | "revpath";
+
+// One-line explanation per metric, shown under the heat map based on the current selection.
+const METRIC_EXPLANATIONS: Record<DemandMetric, string> = {
+  bookings:
+    "Bookings = reservations in the cell ÷ how many times that weekday occurred in the lookback window. Pure demand volume — no capacity awareness, so a cell can run hot here and still be easy to service if plenty of therapists are on shift.",
+  utilization:
+    "Utilization = 100 × (booked slots ÷ weekday occurrences) ÷ capacity, where capacity is whichever is scarcest of therapists, rooms, or equipment. How close to full a typical slot runs.",
+  revenue:
+    "Revenue index = revenue ÷ reservation count for the cell — the average amount a guest spends per reservation in that hour. Blind to volume: one $500 booking outranks ten $200 bookings. Proposed rename: Average Spend.",
+  revpath:
+    "RevPATH = revenue ÷ available treatment hours for the cell. Same revenue numerator as Revenue index, but divided by capacity instead of reservation count, so both rate and volume move it. Proposed — not yet wired to a real capacity source.",
+};
 
 const hourLabels = Array.from({ length: 13 }).map((_, i) => {
   const h = 8 + i; // 8am–8pm
@@ -105,6 +127,16 @@ const hourLabels = Array.from({ length: 13 }).map((_, i) => {
 
 const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
 
+// Raw (unformatted) numeric value for a cell under a given metric — used for both display and color banding.
+const getMetricRawValue = (cell: any, metric: DemandMetric): number =>
+  metric === "bookings"
+    ? cell.bookings
+    : metric === "utilization"
+    ? cell.utilization
+    : metric === "revenue"
+    ? cell.revenueIdx
+    : cell.revpath;
+
 const HistoricalDemandPanel: React.FC<{
   servicesInCategory: { id: string; name: string }[];
   disabled?: boolean;
@@ -112,7 +144,7 @@ const HistoricalDemandPanel: React.FC<{
     day: DayOfWeek;
     startHour: number;
     endHour: number;
-    score: number;
+    avgUtilization: number;
   }) => void;
 }> = ({ servicesInCategory, disabled, onCreateRuleFromSlot }) => {
   const [serviceId, setServiceId] = useState<string>("all");
@@ -127,7 +159,7 @@ React.useEffect(() => {
   return () => window.removeEventListener("mouseup", onUp);
 }, []);
 
-  // Color-coding helper for demand score
+  // Color-coding helper — buckets a 0-100 relative value into Low/Moderate/High/Peak.
   const demandColor = (score: number) => {
     if (score <= 30) {
       return {
@@ -162,7 +194,7 @@ React.useEffect(() => {
 
   const data = useMemo(() => {
     // MOCK demand model (replace with real API later)
-    // Returns a matrix: day -> hour -> { score, bookings, utilization, revenueIdx }
+    // Returns a matrix: day -> hour -> { bookings, utilization, revenueIdx, revpath }
     const days: DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
     const serviceBias =
@@ -184,16 +216,16 @@ React.useEffect(() => {
         const base = 0.18 + 0.28 * midday + 0.18 * evening;
 
         const noise = ((di * 17 + hi * 11) % 13) / 200; // tiny stable noise
-        const score01 = clamp01((base + weekendBoost + dayBoost + serviceBias + noise) * lookbackFactor);
-
-        const score = Math.round(score01 * 100);
+        // Shared 0-1 pattern used only to derive believable mock values below — not itself a metric.
+        const pattern01 = clamp01((base + weekendBoost + dayBoost + serviceBias + noise) * lookbackFactor);
 
         // derived mock stats
-        const bookings = Math.max(0, Math.round(score01 * 12));        // 0–12
-        const utilization = Math.round(score01 * 100);                 // 0–100
-        const revenueIdx = Math.round((0.6 + score01) * 100);          // ~60–160
+        const bookings = Math.max(0, Math.round(pattern01 * 12));        // 0–12
+        const utilization = Math.round(pattern01 * 100);                 // 0–100
+        const revenueIdx = Math.round((0.6 + pattern01) * 100);          // ~60–160
+        const revpath = Math.round(30 + pattern01 * 90);                 // ~$30–120/treatment-hour, mock
 
-        return { score, bookings, utilization, revenueIdx, hour: h };
+        return { bookings, utilization, revenueIdx, revpath, hour: h };
       });
 
       return { day: d, dayLabel: DOW_LABELS[d], cells };
@@ -203,16 +235,48 @@ React.useEffect(() => {
   }, [serviceId, lookbackDays]);
 
   const metricLabel =
-    metric === "bookings" ? "Avg bookings" : metric === "utilization" ? "Avg utilization" : "Revenue index";
+    metric === "bookings"
+      ? "Avg bookings"
+      : metric === "utilization"
+      ? "Avg utilization"
+      : metric === "revenue"
+      ? "Revenue index"
+      : "RevPATH";
+
+  // Short form for use mid-sentence (Insights headers, color caption) — avoids "Avg X's" grammar.
+  const metricShortLabel =
+    metric === "bookings"
+      ? "bookings"
+      : metric === "utilization"
+      ? "utilization"
+      : metric === "revenue"
+      ? "revenue index"
+      : "RevPATH";
 
   const getMetricValue = (cell: any) =>
-    metric === "bookings" ? cell.bookings : metric === "utilization" ? `${cell.utilization}%` : cell.revenueIdx;
+    metric === "utilization"
+      ? `${getMetricRawValue(cell, metric)}%`
+      : metric === "revpath"
+      ? `$${getMetricRawValue(cell, metric)}`
+      : getMetricRawValue(cell, metric);
 
-  // Find top/low windows for summary (simple)
+  // Colors are relative to the selected metric's own range across the visible grid, not a fixed
+  // score — each metric has its own scale (bookings ~0-12, utilization 0-100, etc.), so banding is
+  // normalized to that metric's min/max here rather than compared against a hidden absolute number.
+  const colorScale = useMemo(() => {
+    const values = data.flatMap((r) => r.cells.map((c: any) => getMetricRawValue(c, metric)));
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    return (raw: number) => (max === min ? 50 : Math.round(((raw - min) / (max - min)) * 100));
+  }, [data, metric]);
+
+  // Find top/low windows for summary (simple), based on the selected metric
   const highlights = useMemo(() => {
-    const flat: { day: string; hour: number; score: number }[] = [];
-    data.forEach((r) => r.cells.forEach((c: any) => flat.push({ day: r.day, hour: c.hour, score: c.score })));
-    flat.sort((a, b) => b.score - a.score);
+    const flat: { day: string; hour: number; value: number }[] = [];
+    data.forEach((r) =>
+      r.cells.forEach((c: any) => flat.push({ day: r.day, hour: c.hour, value: getMetricRawValue(c, metric) }))
+    );
+    flat.sort((a, b) => b.value - a.value);
     const top = flat.slice(0, 3);
     const low = [...flat].reverse().slice(0, 3);
 
@@ -223,7 +287,7 @@ React.useEffect(() => {
     };
 
     return { top: top.map(fmt), low: low.map(fmt) };
-  }, [data]);
+  }, [data, metric]);
 
   return (
     <Card size="small" style={{ borderRadius: 10 }} title="Historical demand (mock)">
@@ -274,6 +338,7 @@ React.useEffect(() => {
                   { label: "Bookings", value: "bookings" },
                   { label: "Utilization", value: "utilization" },
                   { label: "Revenue index", value: "revenue" },
+                  { label: "RevPATH (proposed)", value: "revpath" },
                 ]}
                 suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
               />
@@ -285,10 +350,10 @@ React.useEffect(() => {
       <Row gutter={16}>
         <Col xs={24} md={18}>
           <Space size="small" wrap style={{ marginBottom: 8 }}>
-            <Tag color="default">0–30 Low</Tag>
-            <Tag color="cyan">31–60 Moderate</Tag>
-            <Tag color="orange">61–80 High</Tag>
-            <Tag color="red">81–100 Peak</Tag>
+            <Tag color="default">Low</Tag>
+            <Tag color="cyan">Moderate</Tag>
+            <Tag color="orange">High</Tag>
+            <Tag color="red">Peak</Tag>
           </Space>
 
           {selection && (
@@ -307,14 +372,16 @@ React.useEffect(() => {
         const endHour = hourLabels[b].h + 1;
 
         const row = data.find((r) => r.day === selection.day);
-        const scores = row ? row.cells.slice(a, b + 1).map((c: any) => Number(c.score || 0)) : [];
-        const avgScore = scores.length ? Math.round(scores.reduce((s, n) => s + n, 0) / scores.length) : 0;
+        const utilizations = row ? row.cells.slice(a, b + 1).map((c: any) => Number(c.utilization || 0)) : [];
+        const avgUtilization = utilizations.length
+          ? Math.round(utilizations.reduce((s, n) => s + n, 0) / utilizations.length)
+          : 0;
 
         onCreateRuleFromSlot({
           day: selection.day,
           startHour,
           endHour,
-          score: avgScore,
+          avgUtilization,
         });
       }}
     >
@@ -353,7 +420,7 @@ React.useEffect(() => {
                   <div style={{ fontSize: 12, fontWeight: 600 }}>{row.dayLabel}</div>
 
                   {row.cells.map((cell: any, hi: number) => {
-                    const { bg, text, border } = demandColor(cell.score);
+                    const { bg, text, border } = demandColor(colorScale(getMetricRawValue(cell, metric)));
                     const isSelected =
                       selection &&
                       selection.day === row.day &&
@@ -368,7 +435,6 @@ React.useEffect(() => {
                               {row.dayLabel} · {((cell.hour + 11) % 12) + 1}
                               {cell.hour >= 12 ? "PM" : "AM"}
                             </div>
-                            <div>Demand score: {cell.score}/100</div>
                             <div>{metricLabel}: {getMetricValue(cell)}</div>
                           </div>
                         }
@@ -409,7 +475,7 @@ onDoubleClick={() => {
     day: row.day,
     startHour: cell.hour,
     endHour: cell.hour + 1,
-    score: cell.score,
+    avgUtilization: cell.utilization,
   });
 }}
                         >
@@ -423,21 +489,25 @@ onDoubleClick={() => {
             </div>
           </div>
 
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            Demand scores are calculated by analyzing historical bookings, utilization, and revenue at each time slot. These signals are normalized across the lookback window and blended into a 0–100 score used for rule evaluation and adjacent-slot pricing.
+          <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+            {METRIC_EXPLANATIONS[metric]}
+          </Text>
+          <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 4 }}>
+            Colors are scaled to this metric's own range across the view — the Low–Peak bands
+            re-scale whenever you switch metrics.
           </Text>
         </Col>
 
         <Col xs={24} md={6}>
           <Card size="small" style={{ borderRadius: 10 }} title="Insights">
-            <Text strong>Top demand windows</Text>
+            <Text strong>Top {metricShortLabel} windows</Text>
             <div style={{ marginTop: 6, marginBottom: 12 }}>
               {highlights.top.map((t) => (
                 <Tag key={t} style={{ marginBottom: 6 }}>{t}</Tag>
               ))}
             </div>
 
-            <Text strong>Lowest demand windows</Text>
+            <Text strong>Lowest {metricShortLabel} windows</Text>
             <div style={{ marginTop: 6 }}>
               {highlights.low.map((t) => (
                 <Tag key={t} style={{ marginBottom: 6 }}>{t}</Tag>
@@ -472,11 +542,13 @@ type DynamicPricingRule = {
   adjustmentType: AdjustmentType; // pct or amt
   adjustmentValue: number; // 10 = +10% or +$10 depending on type
 
-  // Inventory-based condition (optional)
+  // Inventory-based condition (optional). Matches the deck's rule-trigger metrics exactly:
+  // RemainingSlots and LiveUtilization. Demand score is intentionally not offered here — it's a
+  // historical/planning concept (see the heat map above), not a live per-slot trigger.
   inventoryConditionEnabled?: boolean;
-  inventoryMetric?: "remaining" | "utilization" | "demand_score";
+  inventoryMetric?: "remaining" | "utilization";
   inventoryOperator?: "lt" | "lte" | "gt" | "gte";
-  inventoryThreshold?: number; // remaining slots, utilization %, or demand score depending on metric
+  inventoryThreshold?: number; // remaining slots or utilization %, depending on metric
 
   // Lead time gate (optional) — how far ahead the booking is made, evaluated per slot
   leadTimeMode?: "none" | "window";
@@ -494,13 +566,49 @@ type DynamicPricingRule = {
 
   // Optional service-level exclusions (advanced)
   excludedServiceIds?: string[];
+
+  // Which service categories this rule applies to. A rule is scoped to categories, not the
+  // other way around — a category's "Enable dynamic pricing" toggle still gates whether any
+  // rule can take effect there.
+  categoryIds: string[];
+};
+
+type CueTagColor = "blue" | "red" | "orange" | "green";
+
+type GuestCueTag = {
+  id: string;
+  operator: "lt" | "lte" | "gt" | "gte";
+  valueType: AdjustmentType; // pct or amt — matches rule adjustment types
+  threshold: number; // price adjustment threshold, in % or $ depending on valueType. Negative = discount.
+  label: string; // e.g. "Best Value", "Going Fast"
+  color: CueTagColor;
+};
+
+// Standard 4-color set only (no full palette) — light/dark hexes shown in the picker so admins can
+// see exactly what guests will see in each theme. Values approximate this app's antd theme tokens;
+// confirm exact hex against the design system before shipping.
+const CUE_TAG_COLORS: { key: CueTagColor; label: string; light: string; dark: string }[] = [
+  { key: "blue", label: "Blue", light: "#1677ff", dark: "#3c89e8" },
+  { key: "green", label: "Green", light: "#52c41a", dark: "#49aa19" },
+  { key: "orange", label: "Orange", light: "#fa8c16", dark: "#d87a16" },
+  { key: "red", label: "Red", light: "#f5222d", dark: "#d32029" },
+];
+
+// A guardrail bound is relative to each service's own base price (percent or a fixed dollar amount),
+// not a single absolute price — a flat "$250 max" doesn't work across services with very different
+// price points, so increases/decreases are bounded as a delta off of whatever the base price is.
+type GuardrailBound = {
+  valueType: AdjustmentType; // pct or amt
+  value?: number;
 };
 
 type CategoryDynamicPricing = {
   enabled: boolean;
-  minPrice?: number;
-  maxPrice?: number;
-  rules: DynamicPricingRule[];
+  minIncrease?: GuardrailBound; // smallest allowed price increase, if a rule increases price at all
+  maxIncrease?: GuardrailBound; // largest allowed price increase
+  minDecrease?: GuardrailBound; // smallest allowed discount, if a rule discounts at all
+  maxDecrease?: GuardrailBound; // largest allowed discount
+  guestCueTags: GuestCueTag[];
 };
 
 /* ---------- Mock lookups ---------- */
@@ -584,8 +692,7 @@ const formatInventoryCondition = (r: DynamicPricingRule): string | null => {
   const threshold = r.inventoryThreshold ?? 0;
 
 if (metric === "remaining") return `Remaining slots ${op} ${threshold}`;
-if (metric === "utilization") return `Utilization ${op} ${threshold}%`;
-return `Demand score ${op} ${threshold}/100`;
+return `Utilization ${op} ${threshold}%`;
 };
 
 const formatLeadTime = (r: DynamicPricingRule): string | null => {
@@ -601,6 +708,11 @@ const formatLeadTime = (r: DynamicPricingRule): string | null => {
   const h = r.leadTimeHours ?? 0;
   const dur = [d > 0 ? `${d}d` : "", h > 0 || d === 0 ? `${h}h` : ""].filter(Boolean).join(" ");
   return `Booked ${op} ${dur} before the slot`;
+};
+
+const formatGuardrailBound = (b: GuardrailBound | undefined, sign: "+" | "-"): string => {
+  if (!b || b.value === undefined || b.value === null) return "Not set";
+  return b.valueType === "amt" ? `${sign}$${b.value}` : `${sign}${b.value}%`;
 };
 
 /* ---------- Helpers ---------- */
@@ -662,6 +774,7 @@ const createEmptyDynamicRule = (): DynamicPricingRule => {
     adjacentSlotCount: 1,
     adjacentAdjustmentMode: "relative",
     adjacentAdjustmentValue: 60,
+    categoryIds: [],
   };
 };
 
@@ -1328,9 +1441,13 @@ type DynamicPricingPageProps = {
 };
 
 const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) => {
-  const [selectedCategory, setSelectedCategory] = useState<string>(
-    categories?.[0]?.value || ""
+  // Multi-select: this is a VIEW filter (which categories' guardrails/cue tags you're bulk-editing,
+  // and which rules are shown below) — it is not what decides which categories a rule applies to.
+  // Each rule owns its own "Applies to categories" field (see categoryIds on DynamicPricingRule).
+  const [selectedCategories, setSelectedCategories] = useState<string[]>(
+    categories?.[0] ? [categories[0].value] : []
   );
+  const primaryCategory = selectedCategories[0] || "";
 
   // In a real app this would be loaded/saved per property/venue.
   const [byCategory, setByCategory] = useState<Record<string, CategoryDynamicPricing>>(() => {
@@ -1338,15 +1455,21 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
     categories.forEach((c) => {
       initial[c.value] = {
         enabled: false,
-        minPrice: undefined,
-        maxPrice: undefined,
-        rules: [],
+        guestCueTags: [
+          { id: "cue1", operator: "lte", valueType: "pct", threshold: -10, label: "Best Value", color: "green" },
+          { id: "cue2", operator: "gte", valueType: "pct", threshold: 15, label: "Going Fast", color: "orange" },
+        ],
       };
     });
     return initial;
   });
 
-  const cfg = byCategory[selectedCategory] || { enabled: false, rules: [] };
+  const emptyCfg: CategoryDynamicPricing = { enabled: false, guestCueTags: [] };
+  const cfg = byCategory[primaryCategory] || emptyCfg;
+
+  // Rules are global (not nested per category) — each one carries its own categoryIds scope.
+  const [rules, setRules] = useState<DynamicPricingRule[]>([]);
+  const visibleRules = rules.filter((r) => r.categoryIds.some((c) => selectedCategories.includes(c)));
 
   // Services in the selected category (for exclusions dropdown)
   // NOTE: mocked for demo; in production this should come from real services by category
@@ -1356,7 +1479,7 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
       { id: "svc2", name: "Deep Tissue Massage" },
       { id: "svc3", name: "Couples Massage" },
     ];
-  }, [selectedCategory]);
+  }, [primaryCategory]);
 
   // Helper to map excluded ids to service names
   const getExcludedServiceNames = (rule: DynamicPricingRule): string[] => {
@@ -1367,11 +1490,45 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
   };
 
   /* ---------- Mock availability (demo) ---------- */
+  // Trigger metrics match the deck exactly: LiveUtilization and RemainingSlots. Demand score was
+  // considered as a third trigger (a proprietary blended signal) but shelved for now — it isn't in
+  // the reference deck, and its live-utilization + booking-pace components don't map cleanly onto
+  // a rule trigger without a separate, validated definition. Revisit separately if needed.
   const [mockAvailability, setMockAvailability] = useState({
   remaining: 2, // remaining providers for the booked time slot
   utilization: 85, // utilization % for the booked time slot
-  demandScore: 75, // historical demand score for the slot, 0–100
 });
+
+  /* ---------- Guardrails: edit / apply lock-in ---------- */
+  // Guardrails aren't live-bound to state on every keystroke — they only take effect once "Apply" is
+  // pressed, so a partial edit can't accidentally clamp prices mid-typing.
+  type GuardrailsDraft = {
+    minIncrease: GuardrailBound;
+    maxIncrease: GuardrailBound;
+    minDecrease: GuardrailBound;
+    maxDecrease: GuardrailBound;
+  };
+  const [guardrailsDraft, setGuardrailsDraft] = useState<GuardrailsDraft | null>(null);
+  const isEditingGuardrails = guardrailsDraft !== null;
+
+  const startEditGuardrails = () =>
+    setGuardrailsDraft({
+      minIncrease: cfg.minIncrease || { valueType: "pct" },
+      maxIncrease: cfg.maxIncrease || { valueType: "pct" },
+      minDecrease: cfg.minDecrease || { valueType: "pct" },
+      maxDecrease: cfg.maxDecrease || { valueType: "pct" },
+    });
+  const cancelEditGuardrails = () => setGuardrailsDraft(null);
+  const applyGuardrails = () => {
+    if (!guardrailsDraft) return;
+    updateCategory({
+      minIncrease: guardrailsDraft.minIncrease,
+      maxIncrease: guardrailsDraft.maxIncrease,
+      minDecrease: guardrailsDraft.minDecrease,
+      maxDecrease: guardrailsDraft.maxDecrease,
+    });
+    setGuardrailsDraft(null);
+  };
 
   const evalInventoryCondition = (r: DynamicPricingRule): boolean => {
     if (!r.inventoryConditionEnabled) return true;
@@ -1380,24 +1537,14 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
     const op = r.inventoryOperator || "lt";
     // If older rules (created before inventory conditions existed) are missing a threshold,
     // fall back to sensible defaults instead of treating it as 0 (which often blocks everything).
-      const defaultThreshold =
-    metric === "utilization"
-      ? 80
-      : metric === "demand_score"
-      ? 70
-      : 3;
+    const defaultThreshold = metric === "utilization" ? 80 : 3;
 
     const threshold =
       r.inventoryThreshold === null || r.inventoryThreshold === undefined
         ? defaultThreshold
         : r.inventoryThreshold;
 
-    const left =
-    metric === "remaining"
-      ? mockAvailability.remaining
-      : metric === "utilization"
-      ? mockAvailability.utilization
-      : mockAvailability.demandScore;
+    const left = metric === "remaining" ? mockAvailability.remaining : mockAvailability.utilization;
 
     if (op === "lt") return left < threshold;
     if (op === "lte") return left <= threshold;
@@ -1405,26 +1552,67 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
     return left >= threshold; // gte
   };
 
+  // Writes the same patch to every selected category — editing multiple categories at once
+  // keeps them in sync rather than requiring the same rules/guardrails to be built N times.
   const updateCategory = (patch: Partial<CategoryDynamicPricing>) => {
-    setByCategory((prev) => ({
-      ...prev,
-      [selectedCategory]: {
-        ...prev[selectedCategory],
-        ...patch,
-      },
-    }));
-  };
-
-  const upsertRule = (rule: DynamicPricingRule) => {
-    updateCategory({
-      rules: cfg.rules.some((r) => r.id === rule.id)
-        ? cfg.rules.map((r) => (r.id === rule.id ? rule : r))
-        : [...cfg.rules, rule],
+    setByCategory((prev) => {
+      const next = { ...prev };
+      selectedCategories.forEach((catValue) => {
+        next[catValue] = { ...(next[catValue] || emptyCfg), ...patch };
+      });
+      return next;
     });
   };
 
+  const upsertRule = (rule: DynamicPricingRule) => {
+    setRules((prev) => (prev.some((r) => r.id === rule.id) ? prev.map((r) => (r.id === rule.id ? rule : r)) : [...prev, rule]));
+  };
+
+  const duplicateRule = (rule: DynamicPricingRule) => {
+    const copy: DynamicPricingRule = {
+      ...rule,
+      id: `rule_${Date.now()}`,
+      name: `${rule.name || "Untitled rule"} (copy)`,
+    };
+    setRules((prev) => [...prev, copy]);
+  };
+
   const deleteRule = (id: string) => {
-    updateCategory({ rules: cfg.rules.filter((r) => r.id !== id) });
+    setRules((prev) => prev.filter((r) => r.id !== id));
+  };
+
+  /* ---------- Guest cue tags ---------- */
+  // Evaluated top to bottom against the resulting price adjustment; first matching row (of the
+  // same value type — percent tags only match a percent adjustment, dollar tags only a dollar one) wins.
+  const addGuestCueTag = () => {
+    const next: GuestCueTag = {
+      id: `cue_${Date.now()}`,
+      operator: "gte",
+      valueType: "pct",
+      threshold: 10,
+      label: "",
+      color: "blue",
+    };
+    updateCategory({ guestCueTags: [...(cfg.guestCueTags || []), next] });
+  };
+
+  const updateGuestCueTag = (id: string, patch: Partial<GuestCueTag>) => {
+    updateCategory({
+      guestCueTags: (cfg.guestCueTags || []).map((t) => (t.id === id ? { ...t, ...patch } : t)),
+    });
+  };
+
+  const removeGuestCueTag = (id: string) => {
+    updateCategory({ guestCueTags: (cfg.guestCueTags || []).filter((t) => t.id !== id) });
+  };
+
+  const moveGuestCueTag = (id: string, direction: -1 | 1) => {
+    const tags = [...(cfg.guestCueTags || [])];
+    const idx = tags.findIndex((t) => t.id === id);
+    const swapWith = idx + direction;
+    if (idx === -1 || swapWith < 0 || swapWith >= tags.length) return;
+    [tags[idx], tags[swapWith]] = [tags[swapWith], tags[idx]];
+    updateCategory({ guestCueTags: tags });
   };
 
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
@@ -1433,6 +1621,8 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
 
   const openNewRule = () => {
     const next = createEmptyDynamicRule();
+    // Pre-fill with whatever categories are currently selected — still editable per rule.
+    next.categoryIds = [...selectedCategories];
     setEditingRule(next);
     ruleForm.setFieldsValue({
       ...next,
@@ -1484,6 +1674,7 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
       endTime: timeRange?.[1] || (editingRule?.endTime ?? dayjs()),
       dateRange: values.dateRange,
       excludedServiceIds: values.excludedServiceIds || [],
+      categoryIds: values.categoryIds || [],
     };
     upsertRule(next);
     setRuleModalOpen(false);
@@ -1549,6 +1740,24 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
       ),
     },
     {
+      title: "Categories",
+      key: "categories",
+      width: 170,
+      render: (_, r) => (
+        <Space size={4} wrap>
+          {r.categoryIds.length === 0 ? (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              None selected
+            </Text>
+          ) : (
+            r.categoryIds.map((id) => (
+              <Tag key={id}>{categories.find((c) => c.value === id)?.label || id}</Tag>
+            ))
+          )}
+        </Space>
+      ),
+    },
+    {
       title: "Adjustment",
       key: "adj",
       width: 150,
@@ -1578,12 +1787,17 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
     {
       title: "Actions",
       key: "actions",
-      width: 160,
+      width: 220,
       render: (_, r) => (
         <Space>
           <Button type="text" icon={<EditOutlined />} onClick={() => openEditRule(r)}>
             Edit
           </Button>
+          <Tooltip title="Duplicate this rule">
+            <Button type="text" icon={<CopyOutlined />} onClick={() => duplicateRule(r)}>
+              Duplicate
+            </Button>
+          </Tooltip>
           <Button
             type="text"
             danger
@@ -1615,11 +1829,20 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
         <Row gutter={16} align="middle">
           <Col xs={24} md={10}>
             <Form layout="vertical">
-              <Form.Item label="Service category">
+              <Form.Item
+                label="Service category"
+                extra={
+                  selectedCategories.length > 1
+                    ? `Editing ${selectedCategories.length} categories at once — rules, guardrails, and cue tags apply to all of them.`
+                    : undefined
+                }
+              >
                 <Select
-                  value={selectedCategory}
-                  onChange={setSelectedCategory}
+                  mode="multiple"
+                  value={selectedCategories}
+                  onChange={setSelectedCategories}
                   options={categories}
+                  placeholder="Select one or more categories"
                   suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
                 />
               </Form.Item>
@@ -1655,10 +1878,10 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
         <HistoricalDemandPanel
           servicesInCategory={servicesInCategory}
           disabled={!cfg.enabled}
-          onCreateRuleFromSlot={({ day, startHour, endHour, score }) => {
+          onCreateRuleFromSlot={({ day, startHour, endHour, avgUtilization }) => {
             const start = dayjs().hour(Math.floor(startHour)).minute((startHour % 1) * 60).second(0);
             const end = dayjs().hour(Math.floor(endHour)).minute((endHour % 1) * 60).second(0);
-            const suggestedAdj = score >= 80 ? 15 : score >= 60 ? 10 : 5;
+            const suggestedAdj = avgUtilization >= 80 ? 15 : avgUtilization >= 60 ? 10 : 5;
             const next = createEmptyDynamicRule();
             next.daysOfWeek = [day];
             next.startTime = start;
@@ -1666,14 +1889,15 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
             next.adjustmentType = "pct";
             next.adjustmentValue = suggestedAdj;
             next.inventoryConditionEnabled = true;
-            next.inventoryMetric = "demand_score";
+            next.inventoryMetric = "utilization";
             next.inventoryOperator = "gte";
-            next.inventoryThreshold = score >= 80 ? 75 : score >= 60 ? 60 : 40;
+            next.inventoryThreshold = avgUtilization >= 80 ? 75 : avgUtilization >= 60 ? 60 : 40;
             next.adjacentPricingEnabled = true;
             next.adjacentSlotCount = 1;
             next.adjacentAdjustmentMode = "relative";
             next.adjacentAdjustmentValue = 60;
             next.name = `${DOW_LABELS[day]} ${start.format("h:mma")}–${end.format("h:mma")} demand uplift`;
+            next.categoryIds = [...selectedCategories];
             setEditingRule(next);
             ruleForm.setFieldsValue({
               ...next,
@@ -1686,128 +1910,359 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
         <Divider style={{ margin: "16px 0" }} />
 
         <Row gutter={16}>
-          <Col xs={24} md={12}>
-            <Card size="small" style={{ borderRadius: 10 }} title="Guardrails (optional)">
-              <Row gutter={12}>
-                <Col span={12}>
-                  <Form layout="vertical">
-                    <Form.Item label="Min price">
-                      <InputNumber
-                        prefix="$"
-                        min={0}
-                        style={{ width: "100%" }}
-                        value={cfg.minPrice}
-                        onChange={(val) => updateCategory({ minPrice: val === null ? undefined : Number(val) })}
-                        disabled={!cfg.enabled}
-                      />
-                    </Form.Item>
-                  </Form>
-                </Col>
-                <Col span={12}>
-                  <Form layout="vertical">
-                    <Form.Item label="Max price">
-                      <InputNumber
-                        prefix="$"
-                        min={0}
-                        style={{ width: "100%" }}
-                        value={cfg.maxPrice}
-                        onChange={(val) => updateCategory({ maxPrice: val === null ? undefined : Number(val) })}
-                        disabled={!cfg.enabled}
-                      />
-                    </Form.Item>
-                  </Form>
-                </Col>
-              </Row>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                Guardrails clamp the final price after rules apply.
-              </Text>
+          <Col xs={24}>
+            <Card
+              size="small"
+              style={{ borderRadius: 10 }}
+              title="Guardrails (optional)"
+              extra={
+                !cfg.enabled ? null : isEditingGuardrails ? (
+                  <Space size={4}>
+                    <Button size="small" icon={<CloseOutlined />} onClick={cancelEditGuardrails}>
+                      Cancel
+                    </Button>
+                    <Button size="small" type="primary" icon={<CheckOutlined />} onClick={applyGuardrails}>
+                      Apply
+                    </Button>
+                  </Space>
+                ) : (
+                  <Button size="small" icon={<EditOutlined />} onClick={startEditGuardrails}>
+                    Edit
+                  </Button>
+                )
+              }
+            >
+              {isEditingGuardrails ? (
+                <>
+                  <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+                    Price increases
+                  </Text>
+                  <Row gutter={12}>
+                    {(
+                      [
+                        ["minIncrease", "Min increase"],
+                        ["maxIncrease", "Max increase"],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <Col span={12} key={key}>
+                        <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+                          {label}
+                        </Text>
+                        <Space.Compact style={{ width: "100%" }}>
+                          <Select
+                            style={{ width: 80 }}
+                            value={guardrailsDraft?.[key].valueType}
+                            onChange={(v) =>
+                              setGuardrailsDraft((p) => (p ? { ...p, [key]: { ...p[key], valueType: v } } : p))
+                            }
+                            options={[
+                              { label: "%", value: "pct" },
+                              { label: "$", value: "amt" },
+                            ]}
+                          />
+                          <InputNumber
+                            min={0}
+                            style={{ width: "100%" }}
+                            value={guardrailsDraft?.[key].value}
+                            onChange={(val) =>
+                              setGuardrailsDraft((p) =>
+                                p ? { ...p, [key]: { ...p[key], value: val === null ? undefined : Number(val) } } : p
+                              )
+                            }
+                          />
+                        </Space.Compact>
+                      </Col>
+                    ))}
+                  </Row>
+
+                  <Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: "block", marginTop: 16, marginBottom: 4 }}
+                  >
+                    Price decreases
+                  </Text>
+                  <Row gutter={12}>
+                    {(
+                      [
+                        ["minDecrease", "Min decrease"],
+                        ["maxDecrease", "Max decrease"],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <Col span={12} key={key}>
+                        <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+                          {label}
+                        </Text>
+                        <Space.Compact style={{ width: "100%" }}>
+                          <Select
+                            style={{ width: 80 }}
+                            value={guardrailsDraft?.[key].valueType}
+                            onChange={(v) =>
+                              setGuardrailsDraft((p) => (p ? { ...p, [key]: { ...p[key], valueType: v } } : p))
+                            }
+                            options={[
+                              { label: "%", value: "pct" },
+                              { label: "$", value: "amt" },
+                            ]}
+                          />
+                          <InputNumber
+                            min={0}
+                            style={{ width: "100%" }}
+                            value={guardrailsDraft?.[key].value}
+                            onChange={(val) =>
+                              setGuardrailsDraft((p) =>
+                                p ? { ...p, [key]: { ...p[key], value: val === null ? undefined : Number(val) } } : p
+                              )
+                            }
+                          />
+                        </Space.Compact>
+                      </Col>
+                    ))}
+                  </Row>
+
+                  <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+                    Changes here don't take effect until you press Apply. Bounds are relative to each
+                    service's own base price, not a single dollar amount across the category.
+                  </Text>
+                </>
+              ) : (
+                <>
+                  <Space size={32} wrap>
+                    <div>
+                      <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                        Increase
+                      </Text>
+                      <Text strong>
+                        Min {formatGuardrailBound(cfg.minIncrease, "+")} · Max{" "}
+                        {formatGuardrailBound(cfg.maxIncrease, "+")}
+                      </Text>
+                    </div>
+                    <div>
+                      <Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                        Decrease
+                      </Text>
+                      <Text strong>
+                        Min {formatGuardrailBound(cfg.minDecrease, "-")} · Max{" "}
+                        {formatGuardrailBound(cfg.maxDecrease, "-")}
+                      </Text>
+                    </div>
+                  </Space>
+                  <Text type="secondary" style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+                    Guardrails clamp how much any rule can move the price up or down, relative to each
+                    service's own base price.
+                  </Text>
+                </>
+              )}
             </Card>
           </Col>
+        </Row>
 
-          <Col xs={24} md={12}>
-            <Card size="small" style={{ borderRadius: 10 }} title="Mock availability (demo)">
-              <Row gutter={12}>
-                <Col span={12}>
-                  <Form layout="vertical">
-                    <Form.Item label="Utilization %">
-                      <InputNumber
-                        min={0}
-                        max={100}
-                        style={{ width: "100%" }}
-                        value={mockAvailability.utilization}
-                        onChange={(v) =>
-                          setMockAvailability((p) => ({
-                            ...p,
-                            utilization: Number(v ?? 0),
-                          }))
-                        }
-                        disabled={!cfg.enabled}
-                      />
-                    </Form.Item>
-                  </Form>
-                </Col>
-
-                <Col span={12}>
-                  <Form layout="vertical">
-                    <Form.Item label="Remaining slots">
-                      <InputNumber
-                        min={0}
-                        style={{ width: "100%" }}
-                        value={mockAvailability.remaining}
-                        onChange={(v) =>
-                          setMockAvailability((p) => ({
-                            ...p,
-                            remaining: Number(v ?? 0),
-                          }))
-                        }
-                        disabled={!cfg.enabled}
-                      />
-                    </Form.Item>
-                  </Form>
-                </Col>
-
-                <Col span={12}>
-                  <Form layout="vertical">
-                    <Form.Item label="Demand score">
-                      <InputNumber
-                        min={0}
-                        max={100}
-                        style={{ width: "100%" }}
-                        value={mockAvailability.demandScore}
-                        onChange={(v) =>
-                          setMockAvailability((p) => ({
-                            ...p,
-                            demandScore: Number(v ?? 0),
-                          }))
-                        }
-                        disabled={!cfg.enabled}
-                      />
-                    </Form.Item>
-                  </Form>
-                </Col>
-              </Row>
-
+        <Row style={{ marginTop: 16 }}>
+          <Col span={24}>
+            <Card
+              size="small"
+              style={{ borderRadius: 10 }}
+              title="Guest cue tags (optional)"
+            >
               <Text type="secondary" style={{ fontSize: 12 }}>
-                Use these values to preview how trigger conditions evaluate. (The evaluation window isn't simulated yet — it only appears in the rule summary.)
+                Show guests a short label based on the price adjustment applied to their slot — e.g. "Best
+                Value" when the price is discounted, "Going Fast" when it's marked up. Checked top to bottom;
+                the first matching row wins. A row only matches an adjustment of the same type (percent rows
+                don't match dollar adjustments, and vice versa).
               </Text>
 
-              <Divider style={{ margin: "12px 0" }} />
+              <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                {(cfg.guestCueTags || []).map((t, idx) => {
+                  const isFirst = idx === 0;
+                  const isLast = idx === (cfg.guestCueTags || []).length - 1;
+                  return (
+                    <Row key={t.id} gutter={8} align="middle">
+                      <Col flex="0 0 110px">
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          Price adjustment
+                        </Text>
+                      </Col>
+                      <Col flex="0 0 90px">
+                        <Select
+                          value={t.operator}
+                          onChange={(v) => updateGuestCueTag(t.id, { operator: v })}
+                          disabled={!cfg.enabled}
+                          options={[
+                            { label: "<", value: "lt" },
+                            { label: "≤", value: "lte" },
+                            { label: ">", value: "gt" },
+                            { label: "≥", value: "gte" },
+                          ]}
+                          suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+                        />
+                      </Col>
+                      <Col flex="0 0 110px">
+                        <Select
+                          value={t.valueType}
+                          onChange={(v) => updateGuestCueTag(t.id, { valueType: v })}
+                          disabled={!cfg.enabled}
+                          options={[
+                            { label: "Percent (%)", value: "pct" },
+                            { label: "Dollar ($)", value: "amt" },
+                          ]}
+                          suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+                        />
+                      </Col>
+                      <Col flex="0 0 100px">
+                        <InputNumber
+                          prefix={t.valueType === "amt" ? "$" : undefined}
+                          suffix={t.valueType === "pct" ? "%" : undefined}
+                          style={{ width: "100%" }}
+                          value={t.threshold}
+                          onChange={(v) => updateGuestCueTag(t.id, { threshold: Number(v ?? 0) })}
+                          disabled={!cfg.enabled}
+                        />
+                      </Col>
+                      <Col flex="0 0 24px" style={{ textAlign: "center" }}>
+                        <Text type="secondary">→</Text>
+                      </Col>
+                      <Col flex="auto">
+                        <Input
+                          placeholder="Label shown to guests, e.g. Best Value"
+                          value={t.label}
+                          onChange={(e) => updateGuestCueTag(t.id, { label: e.target.value })}
+                          disabled={!cfg.enabled}
+                          maxLength={24}
+                        />
+                      </Col>
+                      <Col flex="0 0 auto">
+                        <Space size={4}>
+                          {CUE_TAG_COLORS.map((c) => (
+                            <Tooltip key={c.key} title={`${c.label} — light ${c.light}, dark ${c.dark}`}>
+                              <button
+                                type="button"
+                                disabled={!cfg.enabled}
+                                onClick={() => updateGuestCueTag(t.id, { color: c.key })}
+                                style={{
+                                  width: 26,
+                                  height: 20,
+                                  padding: 0,
+                                  borderRadius: 4,
+                                  overflow: "hidden",
+                                  display: "flex",
+                                  cursor: cfg.enabled ? "pointer" : "not-allowed",
+                                  border: t.color === c.key ? "2px solid #1677ff" : "1px solid #d9d9d9",
+                                  boxSizing: "border-box",
+                                }}
+                              >
+                                <span style={{ flex: 1, background: c.light }} />
+                                <span style={{ flex: 1, background: c.dark }} />
+                              </button>
+                            </Tooltip>
+                          ))}
+                        </Space>
+                      </Col>
+                      <Col flex="0 0 auto">
+                        <Space size={4}>
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<ArrowUpOutlined />}
+                            disabled={!cfg.enabled || isFirst}
+                            onClick={() => moveGuestCueTag(t.id, -1)}
+                          />
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<ArrowDownOutlined />}
+                            disabled={!cfg.enabled || isLast}
+                            onClick={() => moveGuestCueTag(t.id, 1)}
+                          />
+                          <Button
+                            type="text"
+                            danger
+                            size="small"
+                            icon={<DeleteOutlined />}
+                            disabled={!cfg.enabled}
+                            onClick={() => removeGuestCueTag(t.id)}
+                          />
+                        </Space>
+                      </Col>
+                    </Row>
+                  );
+                })}
+              </div>
 
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                Pricing order (preview): base price → day/date override → highest priority matching rule (including trigger condition) → clamp to min/max.
-              </Text>
+              <Button
+                type="dashed"
+                size="small"
+                icon={<PlusOutlined />}
+                style={{ marginTop: 12 }}
+                disabled={!cfg.enabled}
+                onClick={addGuestCueTag}
+              >
+                Add tag
+              </Button>
             </Card>
           </Col>
         </Row>
 
         <Divider style={{ margin: "16px 0" }} />
 
+        <Row gutter={16} align="middle" style={{ marginBottom: 8 }}>
+          <Col flex="0 0 auto">
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              Preview trigger conditions with:
+            </Text>
+          </Col>
+          <Col flex="0 0 auto">
+            <Space size={4} align="center">
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Utilization
+              </Text>
+              <InputNumber
+                size="small"
+                min={0}
+                max={100}
+                suffix="%"
+                style={{ width: 80 }}
+                value={mockAvailability.utilization}
+                onChange={(v) => setMockAvailability((p) => ({ ...p, utilization: Number(v ?? 0) }))}
+                disabled={!cfg.enabled}
+              />
+            </Space>
+          </Col>
+          <Col flex="0 0 auto">
+            <Space size={4} align="center">
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                Remaining
+              </Text>
+              <InputNumber
+                size="small"
+                min={0}
+                style={{ width: 70 }}
+                value={mockAvailability.remaining}
+                onChange={(v) => setMockAvailability((p) => ({ ...p, remaining: Number(v ?? 0) }))}
+                disabled={!cfg.enabled}
+              />
+            </Space>
+          </Col>
+        </Row>
+
+        <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
+          Pricing order (preview): base price → day/date override → highest priority matching rule
+          (including trigger condition) → clamp to the increase/decrease guardrails. Showing rules
+          that apply to the category(ies) selected above — a rule can span multiple categories via
+          "Applies to categories" when adding or editing it.
+        </Text>
+
         <Table<DynamicPricingRule>
           rowKey="id"
           columns={columns}
-          dataSource={[...cfg.rules].sort((a, b) => b.priority - a.priority)}
+          dataSource={[...visibleRules].sort((a, b) => b.priority - a.priority)}
           pagination={{ pageSize: 8 }}
-          locale={{ emptyText: cfg.enabled ? "No rules yet. Click 'Add rule' to create one." : "Enable dynamic pricing to add rules." }}
+          locale={{
+            emptyText:
+              selectedCategories.length === 0
+                ? "Select a category above to see its rules."
+                : cfg.enabled
+                ? "No rules yet for the selected category(ies). Click 'Add rule' to create one."
+                : "Enable dynamic pricing to add rules.",
+          }}
         />
       </Card>
 
@@ -1854,6 +2309,20 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
             rules={[{ required: true, message: "Please name this rule" }]}
           >
             <Input placeholder="e.g., Peak hours uplift" />
+          </Form.Item>
+
+          <Form.Item
+            name="categoryIds"
+            label="Applies to categories"
+            tooltip="Which service categories this rule affects. A category also needs its own 'Enable dynamic pricing' toggle on for this rule to take effect there."
+            rules={[{ required: true, message: "Select at least one category" }]}
+          >
+            <Select
+              mode="multiple"
+              placeholder="Select one or more categories"
+              options={categories}
+              suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+            />
           </Form.Item>
 
           <Row gutter={12}>
@@ -1994,18 +2463,9 @@ const DynamicPricingPage: React.FC<DynamicPricingPageProps> = ({ categories }) =
     const enabled = ruleForm.getFieldValue("inventoryConditionEnabled");
     if (!enabled) return null;
 
-    const metric = ruleForm.getFieldValue("inventoryMetric") as
-  | "remaining"
-  | "utilization"
-  | "demand_score"
-  | undefined;
+    const metric = ruleForm.getFieldValue("inventoryMetric") as "remaining" | "utilization" | undefined;
 
-const thresholdLabel =
-  metric === "utilization"
-    ? "Threshold (%)"
-    : metric === "demand_score"
-    ? "Threshold (demand score 0–100)"
-    : "Threshold (remaining slots)";
+const thresholdLabel = metric === "utilization" ? "Threshold (%)" : "Threshold (remaining slots)";
 
     return (
       <>
@@ -2020,7 +2480,6 @@ const thresholdLabel =
                 options={[
                   { label: "Utilization %", value: "utilization" },
                   { label: "Remaining slots", value: "remaining" },
-                  { label: "Demand score", value: "demand_score" },
                 ]}
                 suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
               />
@@ -2097,91 +2556,110 @@ const thresholdLabel =
 <Title level={5} style={{ marginBottom: 4 }}>
   Adjacent time slots
 </Title>
-<Text type="secondary" style={{ fontSize: 12 }}>
-  Optionally apply a reduced adjustment to nearby time slots when this rule is triggered.
-</Text>
 
-<Row gutter={12} align="middle" style={{ marginTop: 8 }}>
-  <Col span={12}>
-    <Form.Item
-      name="adjacentPricingEnabled"
-      label="Apply to nearby slots"
-      valuePropName="checked"
-    >
-      <Switch />
-    </Form.Item>
-  </Col>
-  <Col span={12}>
-    <Form.Item shouldUpdate noStyle>
-      {() => {
-        const enabled = ruleForm.getFieldValue("adjacentPricingEnabled");
-        return (
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            {enabled
-              ? "Nearby slots inherit a smaller pricing adjustment from this rule."
-              : "Keeps pricing limited to the selected rule window."}
-          </Text>
-        );
-      }}
-    </Form.Item>
-  </Col>
-</Row>
+<Form.Item
+  name="adjacentPricingEnabled"
+  label="Apply to nearby slots"
+  valuePropName="checked"
+  style={{ marginTop: 8 }}
+>
+  <Switch />
+</Form.Item>
 
 <Form.Item shouldUpdate noStyle>
   {() => {
     const enabled = ruleForm.getFieldValue("adjacentPricingEnabled");
     const mode = ruleForm.getFieldValue("adjacentAdjustmentMode") as "relative" | "fixed" | undefined;
     const primaryType = ruleForm.getFieldValue("adjustmentType") as AdjustmentType | undefined;
+    const primaryValue = Number(ruleForm.getFieldValue("adjustmentValue") || 0);
+    const adjacentValue = Number(ruleForm.getFieldValue("adjacentAdjustmentValue") || 0);
     if (!enabled) return null;
 
+    const exampleUnit = primaryType === "amt" ? "$" : "%";
+    const relativeExample =
+      mode !== "fixed"
+        ? `Example: this rule is ${primaryType === "amt" ? "$" : ""}${primaryValue || 20}${
+            primaryType === "pct" ? "%" : ""
+          } and adjacent strength is ${adjacentValue || 60}% → neighboring slots get ${
+            primaryType === "amt" ? "$" : ""
+          }${Math.round(((primaryValue || 20) * (adjacentValue || 60)) / 100)}${
+            primaryType === "pct" ? "%" : ""
+          }, on their own — not stacked on top of the primary adjustment.`
+        : null;
+
     return (
-      <Row gutter={12}>
-        <Col span={12}>
-          <Form.Item
-            name="adjacentSlotCount"
-            label="Slots affected"
-            tooltip="Number of time slots before and after the triggered slot."
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <InputNumber min={1} max={4} style={{ width: "100%" }} />
-          </Form.Item>
-        </Col>
+      <>
+        <Row gutter={12}>
+          <Col span={12}>
+            <Form.Item
+              name="adjacentSlotCount"
+              label="Slots affected"
+              tooltip="Number of time slots before AND after the triggered slot — e.g. 1 means one slot on each side, two slots total."
+              rules={[{ required: true, message: "Required" }]}
+            >
+              <InputNumber min={1} max={4} style={{ width: "100%" }} />
+            </Form.Item>
+          </Col>
 
-        <Col span={12}>
-          <Form.Item
-            name="adjacentAdjustmentMode"
-            label="Adjacent pricing"
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <Select
-              options={[
-                { label: "Relative to primary", value: "relative" },
-                { label: "Fixed adjustment", value: "fixed" },
-              ]}
-              suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
-            />
-          </Form.Item>
-        </Col>
+          <Col span={12}>
+            <Form.Item
+              name="adjacentAdjustmentMode"
+              label="Adjacent pricing"
+              tooltip="Relative: derive the neighbor's adjustment as a percentage of this rule's adjustment. Fixed: set the neighbor's adjustment directly, independent of the primary value."
+              rules={[{ required: true, message: "Required" }]}
+            >
+              <Select
+                options={[
+                  { label: "Relative to primary", value: "relative" },
+                  { label: "Fixed adjustment", value: "fixed" },
+                ]}
+                suffixIcon={<ChevronDown size={16} strokeWidth={1.8} />}
+              />
+            </Form.Item>
+          </Col>
 
-        <Col span={24}>
-          <Form.Item
-            name="adjacentAdjustmentValue"
-            label={
-              mode === "fixed"
-                ? `Adjacent adjustment value (${primaryType === "amt" ? "$" : "%"})`
-                : "Adjacent strength (% of primary)"
-            }
-            tooltip={
-              mode === "fixed"
-                ? "Applies this exact adjustment to nearby slots."
-                : "Example: 60 means nearby slots receive 60% of the primary adjustment."
-            }
-            rules={[{ required: true, message: "Required" }]}
-          >
-            <InputNumber min={0} style={{ width: "100%" }} />
-          </Form.Item>
-        </Col>
-      </Row>
+          <Col span={24}>
+            <Form.Item
+              name="adjacentAdjustmentValue"
+              label={
+                mode === "fixed"
+                  ? `Adjacent adjustment value (${exampleUnit})`
+                  : "Adjacent strength (% of primary)"
+              }
+              tooltip={
+                mode === "fixed"
+                  ? "Applies this exact adjustment to nearby slots, regardless of what the primary adjustment is."
+                  : "Example: 60 means nearby slots receive 60% of the primary rule's adjustment amount."
+              }
+              rules={[{ required: true, message: "Required" }]}
+            >
+              <InputNumber min={0} style={{ width: "100%" }} />
+            </Form.Item>
+          </Col>
+        </Row>
+
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 4, marginBottom: 8 }}
+          message="How this works"
+          description={
+            <div style={{ fontSize: 12 }}>
+              <div>
+                Nudges the price of the slot(s) immediately before and after the one that triggered this rule,
+                so pricing steps down gradually instead of cutting off sharply next to a peak slot. Each
+                neighboring slot uses only the adjacent adjustment below, on its own — it never also receives
+                this rule's primary adjustment, and the two are never added together on the same slot.
+              </div>
+              {relativeExample && <div style={{ marginTop: 4 }}>{relativeExample}</div>}
+              <div style={{ marginTop: 4 }}>
+                If a neighboring slot also matches a rule of its own, normal priority order decides which rule's
+                adjustment wins for that slot — adjacent pricing doesn't override higher-priority rules.
+              </div>
+            </div>
+          }
+        />
+      </>
     );
   }}
 </Form.Item>
